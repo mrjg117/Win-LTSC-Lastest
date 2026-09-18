@@ -21,7 +21,12 @@ if ($BranchId -ne '26100') {
 }
 
 $appsDir = Join-Path $WorkDir 'assets\apps'
-if (-not (Test-Path $appsDir)) { Log "无 assets\apps 目录，跳过"; return }
+# 无任何 msixbundle 时跳过：不要为了挂一次 WIM 白白花几分钟 mount+save
+$bundles = @(Get-ChildItem $appsDir -Filter '*.msixbundle' -File -ErrorAction SilentlyContinue)
+if (-not (Test-Path $appsDir) -or $bundles.Count -eq 0) {
+    Log "assets\apps 下无 *.msixbundle，跳过应用预装（请把 Store/Paint/Notepad/... 离线包放进该目录）"
+    return
+}
 
 $mount = Join-Path $WorkDir 'mount'
 $installWim = Join-Path $WorkDir 'ISO\sources\install.wim'   # [SPIKE] 路径随 W10UI 输出确认

@@ -18,6 +18,9 @@ function Log($m){ "$(Get-Date -Format 'HH:mm:ss') $m" | Tee-Object -FilePath $lo
 $mount = Join-Path $WorkDir 'mount'
 $redist = Join-Path $WorkDir 'assets\redist'
 if (-not (Test-Path $redist)) { Log "无 redist 目录，跳过 VC++ 注入"; return }
+# 无实际安装包时直接跳过：不要为了挂一次 WIM 白白花 3 分钟 mount+save
+$files = Get-ChildItem $redist -Filter 'vc_redist*.exe' -File -ErrorAction SilentlyContinue | Sort-Object Name
+if (-not $files -or $files.Count -eq 0) { Log "assets\redist 下无 vc_redist*.exe，跳过（请把官方安装包放进该目录）"; return }
 
 $installWim = Join-Path $WorkDir 'ISO\sources\install.wim'   # [SPIKE] 路径随 W10UI 输出确认
 if (Test-Path $mount) {
@@ -32,7 +35,6 @@ Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
 Log "已挂载 install.wim -> $mount"
 
 # 顺序：2005 -> 2022；x86 先于 x64（用文件名排序近似）
-$files = Get-ChildItem $redist -Filter 'vc_redist*.exe' | Sort-Object Name
 foreach ($exe in $files) {
     $extracted = Join-Path $WorkDir "tmp\vcpp\$($exe.BaseName)"
     New-Item -ItemType Directory -Force -Path $extracted | Out-Null

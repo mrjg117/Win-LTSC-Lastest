@@ -122,28 +122,59 @@ jobs:
           cd src
           Patch.cmd ${{ matrix.branch }}
 
-      - name: 读取 UBR + ISO 分块（≤1.9GiB）
+      - name: 读取 UBR -> TAG + 释放 DVD 目录 + 创建 Release（manifest/logs）
         if: env.SKIP != '1'
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $m = Get-Content src/manifest.json | ConvertFrom-Json
           $ubr = $m.targetUBR
           $ym = Get-Date -Format yyyyMM
           $tag = "iso-${{ matrix.branch }}-$ym-$ubr"
           echo "TAG=$tag" >> $env:GITHUB_ENV
-          & src/bin/7z.exe a -v1900m "out\WinLTSC-${{ matrix.branch }}.7z" "out\WinLTSC-${{ matrix.branch }}.iso" | Out-Null
           Write-Host "TAG=$tag"
+          # 释放磁盘：最终 ISO 已封装完，中间 DVD 目录(~5.3GB)不再需要。runner D: 仅约 14GB。
+          Remove-Item src/ISO -Recurse -Force -ErrorAction SilentlyContinue
+          if ($env:DO_RELEASE -eq 'true') {
+            $logs = @(Get-ChildItem src/logs -Filter *.log -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+            gh release create "$tag" --repo "${{ github.repository }}" --title "$tag" --notes "branch=${{ matrix.branch }} | upstream_commit=$env:UPSTREAM_COMMIT | UBR=$ubr | 见 manifest.json" @logs src/manifest.json
+          }
 
-      - name: 上传 Release（分块 + manifest + logs）
+      - name: 分片上传 ISO（≤1.9GiB/片，上岸即删）
         if: env.DO_RELEASE == 'true' && env.SKIP != '1'
-        shell: bash
+        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$TAG" --repo "${{ github.repository }}" \
-            --title "$TAG" \
-            --notes "branch=${{ matrix.branch }} | upstream_commit=$UPSTREAM_COMMIT | 见 manifest.json" \
-            out/WinLTSC-${{ matrix.branch }}.7z.* src/manifest.json src/logs/*.log
+          # 逐片生成 -> 上传 -> 立即删除，避免 ISO(7.9GB)+全部分片(~7.9GB) 同时占盘撑爆 runner
+          $iso = Get-Item "out/WinLTSC-${{ matrix.branch }}.iso"
+          $size = $iso.Length
+          $chunk = 1900L * 1024L * 1024L
+          $buf = New-Object byte[] (16777216)
+          $idx = 1
+          $fs = [System.IO.File]::OpenRead($iso.FullName)
+          try {
+            while ($fs.Position -lt $size) {
+              $name = "out/WinLTSC-${{ matrix.branch }}.part{0:D3}" -f $idx
+              $out = [System.IO.File]::Create($name)
+              try {
+                $written = 0L
+                while ($written -lt $chunk -and $fs.Position -lt $size) {
+                  $toRead = [int][Math]::Min([long]$buf.Length, $chunk - $written)
+                  $n = $fs.Read($buf, 0, $toRead)
+                  if ($n -le 0) { break }
+                  $out.Write($buf, 0, $n)
+                  $written += $n
+                }
+              } finally { $out.Close() }
+              Write-Host "upload $name ($([math]::Round($written/1MB,1)) MB)"
+              gh release upload "$env:TAG" $name --repo "${{ github.repository }}" --clobber
+              Remove-Item $name -Force
+              $idx++
+            }
+          } finally { $fs.Close() }
+          Write-Host "共上传 $($idx - 1) 片"
 
       - name: 安装 rclone（R2 / OneDrive 通道）
         if: (env.DO_R2 == 'true' || env.DO_ONEDRIVE == 'true') && env.SKIP != '1'
