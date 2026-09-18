@@ -64,6 +64,13 @@ echo [%date% %time%] [02] Fetch-Updates >> "%LOG%"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\02.Fetch-Updates.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
+REM ---- 02b 用上游 meta4(Metalink) 下载补丁到 patch\ ----
+REM W10UI.cmd 自身不下载更新，只集成 Repo(=%cd%\patch) 下已有的补丁；
+REM patch\ 为空则 cmd_repo=0，等于没打补丁。此步照抄上游 Start.cmd 的 [4/4]。
+echo [%date% %time%] [02b] Fetch-Updates-Meta4 >> "%LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\02b.Fetch-Updates-Meta4.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+if errorlevel 1 goto :fail
+
 REM ---- 上游 W10UI.cmd 集成补丁到 install.wim ----
 REM [SPIKE] W10UI.cmd 读取分布文件夹 ISO\ 并集成补丁，输出位置假设为 ISO\sources\install.wim。
 REM        其是否消费我们 updates\ 下的本地 msu 取决于 W10UI.ini 的更新源配置（需实机校准）。

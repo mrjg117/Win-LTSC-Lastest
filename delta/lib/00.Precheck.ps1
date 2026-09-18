@@ -29,7 +29,7 @@ Log "上游关键文件齐全"
 
 # delta 脚本齐全
 $lib = Join-Path $WorkDir 'lib'
-@('01.Build-Manifest.ps1','02.Fetch-Updates.ps1','03.Integrate-VCpp.ps1',
+@('01.Build-Manifest.ps1','02.Fetch-Updates.ps1','02b.Fetch-Updates-Meta4.ps1','03.Integrate-VCpp.ps1',
   '04.Integrate-Drivers.ps1','05.Integrate-Apps.ps1','06.Patch-Components.ps1',
   '07.Assert-UBR.ps1','08.Bake-Image.ps1','99.Force-W10UI-Ini.ps1') | ForEach-Object {
     if (-not (Test-Path (Join-Path $lib $_))) { Log "FAIL 缺少 delta 脚本: $_"; throw "预检失败: $_" }
