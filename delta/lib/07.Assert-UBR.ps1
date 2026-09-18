@@ -21,7 +21,13 @@ $mount = Join-Path $WorkDir 'mount'
 $installWim = Join-Path $WorkDir 'ISO\sources\install.wim'   # [SPIKE] 路径随 W10UI 输出确认
 $manifest = Get-Content (Join-Path $WorkDir 'manifest.json') -Raw | ConvertFrom-Json
 $targetUBR = $manifest.targetUBR
-$targetBuild = $manifest.build
+$targetBuild = [int]$manifest.build
+
+$pl = Get-Content (Join-Path $WorkDir 'patchlist.json') -Raw | ConvertFrom-Json
+$branchCfg = $pl.branches.$BranchId
+$family = @($branchCfg.buildFamily)
+if ($family.Count -eq 0) { $family = @($targetBuild) }
+$pinBuild = [bool]$branchCfg.pinBuild
 
 if (Test-Path $mount) {
     try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
@@ -38,9 +44,20 @@ try {
     $curUBR = [int]($cv.UBR)
     Log "build=$curBuild UBR=$curUBR (期望 build主版本=$targetBuild UBR>=$targetUBR)"
 
-    # 断言1: build 主版本一致
-    if ([Math]::Floor($curBuild/100) -ne [Math]::Floor($targetBuild/100)) {
-        throw "断言失败: build 主版本不一致 ($curBuild vs 期望 $targetBuild)"
+    # 断言1: build 属于该分支的"同一服务化家族"
+    # [背景] 同一平台(Germanium / 21H2)的多个年度版本共享累积更新与启用包(enablement)。
+    #        上游 meta4 里含启用包，集成后映像的 build 会从基线数跳到当前最新分支
+    #        （实测：26100.1742 --补丁--> 26300.9457，即 LTSC2024 基线 -> 26H2）。
+    #        这是上游行为而非错误，故只告警；若要锁死在基线 build，在 patchlist.json
+    #        把该分支的 pinBuild 置 true 即可让此步直接失败。
+    if ($curBuild -ne $targetBuild) {
+        if ($pinBuild) {
+            throw "断言失败: build 发生变化 ($curBuild vs 锁定值 $targetBuild)。pinBuild=true，按构建中止处理。"
+        }
+        if ($family -notcontains $curBuild) {
+            throw "断言失败: build $curBuild 不在 $BranchId 的家族范围 [$($family -join ',')] 内（疑似选错基线 ISO 或集成异常）"
+        }
+        Log "WARN build 由基线 $targetBuild 变为 $curBuild（家族内 [$($family -join ',')]）：上游 meta4 含启用包，已随补丁升级到该平台当前最新分支。若要锁死请把 patchlist.json 的 pinBuild 置 true。"
     }
     # 断言2: UBR >= target（targetUBR 为占位符时跳过，仅告警）
     if (IsUnset $targetUBR) {
@@ -60,10 +77,12 @@ try {
         Log "LCU=$kb 已安装"
     }
 
-    # 回写实测 UBR 供下游打 tag，避免用占位符生成垃圾 tag
-    $manifest.targetUBR = "$curBuild.$curUBR"
+    # 回写实测版本供下游打 tag，避免用占位符生成垃圾 tag
+    $manifest | Add-Member -MemberType NoteProperty -Name actualBuild -Value $curBuild -Force
+    $manifest | Add-Member -MemberType NoteProperty -Name actualUBR -Value $curUBR -Force
+    $manifest.targetUBR = "$curUBR"
     $manifest | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $WorkDir 'manifest.json')
-    Log "已回写实测 UBR -> manifest.json: $($manifest.targetUBR)"
+    Log "已回写实测版本 -> manifest.json: ${curBuild}.${curUBR}"
 
     Log "== 断言通过: build=$curBuild UBR=$curUBR =="
 } finally {
