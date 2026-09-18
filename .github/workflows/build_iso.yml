@@ -252,9 +252,12 @@ jobs:
           KEEP: ${{ env.KEEP_RELEASE }}
         run: |
           $keep = [int]$env:KEEP
-          $raw = gh release list --repo "${{ github.repository }}" --json tagName --jq '.[].tagName'
-          $tags = $raw | ConvertFrom-Json | Where-Object { $_ -like "iso-${{ matrix.branch }}-*" } | Sort-Object
-          $old = $tags | Select-Object -Skip $keep
+          # [关键] gh --jq 输出的是"未加引号的纯文本行"，不是 JSON，不能再 ConvertFrom-Json
+          $raw = @(gh release list --repo "${{ github.repository }}" --limit 100 --json tagName --jq '.[].tagName')
+          # 降序=最新在前，Skip $keep 才能删掉"最旧的"、保留"最新的"
+          $tags = @($raw | Where-Object { $_ -match '^iso-${{ matrix.branch }}-' } | Sort-Object -Descending)
+          Write-Host "现有 iso-${{ matrix.branch }}-* 标签：$($tags.Count) 个 -> $($tags -join ', ')"
+          $old = @($tags | Select-Object -Skip $keep)
           foreach ($t in $old) {
             gh release delete $t --repo "${{ github.repository }}" --yes
             gh api --method DELETE "/repos/${{ github.repository }}/git/refs/tags/$t" 2>$null
@@ -275,8 +278,8 @@ jobs:
           KEEP: ${{ env.KEEP_R2 }}
         run: |
           $keep = [int]$env:KEEP
-          $dirs = rclone lsd "r2:$env:R2_BUCKET" | ForEach-Object { ($_ -split '\s+')[-1] } | Where-Object { $_ -like "iso-${{ matrix.branch }}-*" } | Sort-Object
-          $old = $dirs | Select-Object -Skip $keep
+          $dirs = @(rclone lsd "r2:$env:R2_BUCKET" | ForEach-Object { ($_ -split '\s+')[-1] } | Where-Object { $_ -like "iso-${{ matrix.branch }}-*" } | Sort-Object -Descending)
+          $old = @($dirs | Select-Object -Skip $keep)
           foreach ($d in $old) { rclone purge "r2:$env:R2_BUCKET/$d"; Write-Host "pruned r2 $d" }
 
       - name: prune OneDrive（保留 KEEP_ONEDRIVE 个）
@@ -289,6 +292,6 @@ jobs:
           $dir = "$env:USERPROFILE\.config\rclone"
           [IO.File]::WriteAllBytes("$dir\rclone.conf", [Convert]::FromBase64String($env:ONEDRIVE_RCLONE_CONF_B64))
           $keep = [int]$env:KEEP
-          $dirs = rclone lsd "onedrive:WinLTSC" | ForEach-Object { ($_ -split '\s+')[-1] } | Where-Object { $_ -like "iso-${{ matrix.branch }}-*" } | Sort-Object
-          $old = $dirs | Select-Object -Skip $keep
+          $dirs = @(rclone lsd "onedrive:WinLTSC" | ForEach-Object { ($_ -split '\s+')[-1] } | Where-Object { $_ -like "iso-${{ matrix.branch }}-*" } | Sort-Object -Descending)
+          $old = @($dirs | Select-Object -Skip $keep)
           foreach ($d in $old) { rclone purge "onedrive:WinLTSC/$d"; Write-Host "pruned onedrive $d" }
