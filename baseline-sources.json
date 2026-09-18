@@ -3,8 +3,8 @@
     "isoName": "zh-cn_windows_10_enterprise_ltsc_2021_x64_dvd_033b7312.iso",
     "sources": [
       {
-        "name": "massgrave (Microsoft MVS CDN mirror)",
-        "url": "https://drive.massgrave.dev/zh-cn_windows_10_enterprise_ltsc_2021_x64_dvd_033b7312.iso"
+        "name": "testip mirror",
+        "url": "https://download.testip.xyz/windows/zh-cn_windows_10_enterprise_ltsc_2021_x64_dvd_033b7312.iso"
       }
     ]
   },
@@ -12,8 +12,8 @@
     "isoName": "zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso",
     "sources": [
       {
-        "name": "massgrave (Microsoft MVS CDN mirror)",
-        "url": "https://drive.massgrave.dev/zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso"
+        "name": "testip mirror",
+        "url": "https://download.testip.xyz/windows/zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso"
       }
     ]
   }
