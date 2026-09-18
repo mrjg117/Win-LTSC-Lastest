@@ -18,6 +18,15 @@ if %errorlevel% neq 0 (
 
 set "BRANCH=%1"
 if "%BRANCH%"=="" set "BRANCH=26100"
+
+REM ---- 确保 logs 目录存在 ----
+REM [关键] cmd 的 >> 重定向失败会导致该行命令被完全跳过（不执行、不留痕），
+REM        必须先建目录，否则所有脚本静默不跑且拿不到任何诊断。
+if not exist "%WORKDIR%logs" mkdir "%WORKDIR%logs"
+if not exist "%WORKDIR%logs" (
+    echo [ERROR] 无法创建 logs 目录：%WORKDIR%logs
+    exit /b 1
+)
 set "LOG=%WORKDIR%logs\Patch.log"
 echo [%date% %time%] Patch.cmd 开始 branch=%BRANCH% > "%LOG%"
 
