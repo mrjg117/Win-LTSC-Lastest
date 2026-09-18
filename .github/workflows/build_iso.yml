@@ -1,0 +1,222 @@
+﻿name: Build ISO
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "目标分支"
+        required: true
+        default: "26100"
+        type: choice
+        options: ["19044", "26100"]
+      upload_release:
+        description: "上传到仓库 Release"
+        type: boolean
+        default: true
+      upload_r2:
+        description: "上传到 Cloudflare R2"
+        type: boolean
+        default: false
+      upload_onedrive:
+        description: "上传到 OneDrive"
+        type: boolean
+        default: false
+      keep_release:
+        description: "Release 保留版本数"
+        type: number
+        default: 3
+      keep_r2:
+        description: "R2 保留版本数"
+        type: number
+        default: 1
+      keep_onedrive:
+        description: "OneDrive 保留版本数"
+        type: number
+        default: 2
+  repository_dispatch:
+    types: [build-by-update]
+  schedule:
+    # 每月第3周三 02:00 UTC 兜底（运行前查本月是否已构建，已构建则跳过，避免与事件驱动重复）
+    - cron: "0 2 15-21 * 3"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        branch: ${{ github.event_name == 'workflow_dispatch' && fromJson(format('["{0}"]', inputs.branch)) || fromJson('["19044","26100"]') }}
+    env:
+      BRANCH: ${{ matrix.branch }}
+      DO_RELEASE: ${{ (github.event_name == 'workflow_dispatch' && inputs.upload_release) || (github.event_name == 'repository_dispatch' && github.event.client_payload.upload_release) || true }}
+      DO_R2: ${{ (github.event_name == 'workflow_dispatch' && inputs.upload_r2) || (github.event_name == 'repository_dispatch' && github.event.client_payload.upload_r2) || false }}
+      DO_ONEDRIVE: ${{ (github.event_name == 'workflow_dispatch' && inputs.upload_onedrive) || (github.event_name == 'repository_dispatch' && github.event.client_payload.upload_onedrive) || false }}
+      KEEP_RELEASE: ${{ (github.event_name == 'workflow_dispatch' && inputs.keep_release) || (github.event_name == 'repository_dispatch' && github.event.client_payload.keep_release) || 3 }}
+      KEEP_R2: ${{ (github.event_name == 'workflow_dispatch' && inputs.keep_r2) || (github.event_name == 'repository_dispatch' && github.event.client_payload.keep_r2) || 1 }}
+      KEEP_ONEDRIVE: ${{ (github.event_name == 'workflow_dispatch' && inputs.keep_onedrive) || (github.event_name == 'repository_dispatch' && github.event.client_payload.keep_onedrive) || 2 }}
+
+    steps:
+      - name: Checkout 本仓库（delta + 配置 + 工作流）
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: 拉上游最新 master（只读，不写）
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/adavak/Win_ISO_Patching_Scripts.git src
+          echo "UPSTREAM_COMMIT=$(cd src && git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: 套 delta 到上游快照（删 update-meta4.yml）
+        shell: bash
+        run: |
+          cp -r self/delta/* src/
+          rm -f src/.github/workflows/update-meta4.yml || true
+
+      - name: cron 去重（仅每月兜底，本月已构建则跳过）
+        if: github.event_name == 'schedule'
+        shell: bash
+        run: |
+          YM=$(date +%Y%m)
+          if gh release list --repo "${{ github.repository }}" --limit 200 2>/dev/null | grep -q "iso-${{ matrix.branch }}-$YM"; then
+            echo "SKIP=1" >> "$GITHUB_ENV"
+            echo "本月已有 iso-${{ matrix.branch }}-$YM 构建，跳过"
+          fi
+
+      - name: 从 baseline Release 拉分块 -> 7z 重组 -> SHA256 校验
+        if: env.SKIP != '1'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $branch = "${{ matrix.branch }}"
+          New-Item -ItemType Directory -Force -Path chunks | Out-Null
+          gh release download baseline --repo "${{ github.repository }}" --dir chunks --pattern "*$branch.7z.*"
+          $first = Get-ChildItem chunks -Filter "*$branch.7z.001" | Select-Object -First 1
+          if (-not $first) { throw "未找到 baseline 分块（请先用 tools/upload-baseline.ps1 上传官方 ISO 分卷）" }
+          & src/bin/7z.exe x $first.FullName -obaseline_out | Out-Null
+          $iso = Get-ChildItem baseline_out -Filter *.iso | Select-Object -First 1
+          if (-not $iso) { throw "7z 重组未产出 ISO" }
+          Move-Item $iso.FullName "src\baseline-$branch.iso" -Force
+          $actual = (Get-FileHash "src\baseline-$branch.iso" -Algorithm SHA256).Hash
+          $yml = Get-Content self/config.yml -Raw
+          $m = [regex]::Match($yml, '"' + $branch + '"\s*:\s*"([0-9a-fA-F]{64})"')
+          if (-not $m.Success) { throw "config.yml 未配置 $branch 的 SHA256" }
+          $expected = $m.Groups[1].Value
+          if ($actual -ne $expected) { throw "baseline SHA256 不符! 期望 $expected 实际 $actual" }
+          Write-Host "baseline SHA256 OK: $actual"
+
+      - name: 运行 Patch.cmd（A→B→W10UI→E→D）
+        if: env.SKIP != '1'
+        shell: cmd
+        run: |
+          cd src
+          Patch.cmd ${{ matrix.branch }}
+
+      - name: 读取 UBR + ISO 分块（≤1.9GiB）
+        if: env.SKIP != '1'
+        shell: pwsh
+        run: |
+          $m = Get-Content src/manifest.json | ConvertFrom-Json
+          $ubr = $m.targetUBR
+          $ym = Get-Date -Format yyyyMM
+          $tag = "iso-${{ matrix.branch }}-$ym-$ubr"
+          echo "TAG=$tag" >> $env:GITHUB_ENV
+          & src/bin/7z.exe a -v1900m "out\WinLTSC-${{ matrix.branch }}.7z" "out\WinLTSC-${{ matrix.branch }}.iso" | Out-Null
+          Write-Host "TAG=$tag"
+
+      - name: 上传 Release（分块 + manifest + logs）
+        if: env.DO_RELEASE == 'true' && env.SKIP != '1'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$TAG" --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes "branch=${{ matrix.branch }} | upstream_commit=$UPSTREAM_COMMIT | 见 manifest.json" \
+            out/WinLTSC-${{ matrix.branch }}.7z.* src/manifest.json src/logs/*.log
+
+      - name: 安装 rclone（R2 / OneDrive 通道）
+        if: (env.DO_R2 == 'true' || env.DO_ONEDRIVE == 'true') && env.SKIP != '1'
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://downloads.rclone.org/rclone-current-windows-amd64.zip -OutFile rclone.zip
+          Expand-Archive rclone.zip -DestinationPath rclone_bin
+          $rclone = (Get-ChildItem rclone_bin -Recurse -Filter rclone.exe | Select-Object -First 1).DirectoryName
+          echo "$rclone" >> $env:GITHUB_PATH
+
+      - name: 上传 R2（S3 兼容）
+        if: env.DO_R2 == 'true' && env.SKIP != '1'
+        shell: pwsh
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          RCLONE_CONFIG_R2_REGION: auto
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone copy "out\WinLTSC-${{ matrix.branch }}.iso" "r2:$env:R2_BUCKET/iso-${{ matrix.branch }}-$env:TAG/"
+
+      - name: 上传 OneDrive
+        if: env.DO_ONEDRIVE == 'true' && env.SKIP != '1'
+        shell: pwsh
+        env:
+          ONEDRIVE_RCLONE_CONF_B64: ${{ secrets.ONEDRIVE_RCLONE_CONF }}
+        run: |
+          $dir = "$env:USERPROFILE\.config\rclone"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          [IO.File]::WriteAllBytes("$dir\rclone.conf", [Convert]::FromBase64String($env:ONEDRIVE_RCLONE_CONF_B64))
+          rclone copy "out\WinLTSC-${{ matrix.branch }}.iso" "onedrive:WinLTSC/iso-${{ matrix.branch }}-$env:TAG/"
+
+      - name: prune Release（保留 KEEP_RELEASE 个）
+        if: env.DO_RELEASE == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP: ${{ env.KEEP_RELEASE }}
+        run: |
+          $keep = [int]$env:KEEP
+          $raw = gh release list --repo "${{ github.repository }}" --json tagName --jq '.[].tagName'
+          $tags = $raw | ConvertFrom-Json | Where-Object { $_ -like "iso-${{ matrix.branch }}-*" } | Sort-Object
+          $old = $tags | Select-Object -Skip $keep
+          foreach ($t in $old) {
+            gh release delete $t --repo "${{ github.repository }}" --yes
+            gh api --method DELETE "/repos/${{ github.repository }}/git/refs/tags/$t" 2>$null
+            Write-Host "pruned release $t"
+          }
+
+      - name: prune R2（保留 KEEP_R2 个）
+        if: env.DO_R2 == 'true'
+        shell: pwsh
+        env:
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          RCLONE_CONFIG_R2_REGION: auto
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          KEEP: ${{ env.KEEP_R2 }}
+        run: |
+          $keep = [int]$env:KEEP
+          $dirs = rclone lsd "r2:$env:R2_BUCKET" | ForEach-Object { ($_ -split '\s+')[-1] } | Where-Object { $_ -like "iso-${{ matrix.branch }}-*" } | Sort-Object
+          $old = $dirs | Select-Object -Skip $keep
+          foreach ($d in $old) { rclone purge "r2:$env:R2_BUCKET/$d"; Write-Host "pruned r2 $d" }
+
+      - name: prune OneDrive（保留 KEEP_ONEDRIVE 个）
+        if: env.DO_ONEDRIVE == 'true'
+        shell: pwsh
+        env:
+          ONEDRIVE_RCLONE_CONF_B64: ${{ secrets.ONEDRIVE_RCLONE_CONF }}
+          KEEP: ${{ env.KEEP_ONEDRIVE }}
+        run: |
+          $dir = "$env:USERPROFILE\.config\rclone"
+          [IO.File]::WriteAllBytes("$dir\rclone.conf", [Convert]::FromBase64String($env:ONEDRIVE_RCLONE_CONF_B64))
+          $keep = [int]$env:KEEP
+          $dirs = rclone lsd "onedrive:WinLTSC" | ForEach-Object { ($_ -split '\s+')[-1] } | Where-Object { $_ -like "iso-${{ matrix.branch }}-*" } | Sort-Object
+          $old = $dirs | Select-Object -Skip $keep
+          foreach ($d in $old) { rclone purge "onedrive:WinLTSC/$d"; Write-Host "pruned onedrive $d" }

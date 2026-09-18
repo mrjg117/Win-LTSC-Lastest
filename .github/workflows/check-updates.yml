@@ -1,0 +1,64 @@
+﻿name: Check Updates
+
+on:
+  schedule:
+    # 每日 06:00 UTC，Patch Tuesday 当天也能及时捕获新累积更新
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        branch: ["19044", "26100"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检测最新累积更新 UBR
+        id: detect
+        shell: pwsh
+        run: |
+          $branch = "${{ matrix.branch }}"
+          $pl = Get-Content patchlist.json | ConvertFrom-Json
+          $cur = $pl.branches.$branch.targetUBR
+          # [SPIKE] 检测源：Microsoft Update Catalog 搜索解析，或 UUPdump API。
+          #         HTML/API 结构需实机校准；解析失败则标记 warning 且不静默触发。
+          $q = [Uri]::EscapeDataString("$branch cumulative")
+          $latest = $null
+          try {
+            $html = Invoke-RestMethod "https://www.catalog.update.microsoft.com/Search.aspx?q=$q" -TimeoutSec 30
+            $m = [regex]::Matches($html, "$branch\.(\d+)")
+            $latest = ($m | ForEach-Object { [int]$_.Groups[1].Value } | Sort-Object -Descending | Select-Object -First 1)
+          } catch {
+            Write-Host "WARN 检测失败（不触发，等每日重试）: $_"
+          }
+          if (-not $latest) { echo "changed=false" >> $env:GITHUB_OUTPUT; break }
+          if ([int]$latest -le [int]$cur) { echo "changed=false" >> $env:GITHUB_OUTPUT; break }
+          echo "changed=true" >> $env:GITHUB_OUTPUT
+          echo "newubr=$latest" >> $env:GITHUB_OUTPUT
+          Write-Host "检测到新 UBR: $latest (当前 $cur)"
+
+      - name: 更新 patchlist + 触发构建
+        if: steps.detect.outputs.changed == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEWUBR: ${{ steps.detect.outputs.newubr }}
+        run: |
+          $branch = "${{ matrix.branch }}"
+          # 更新 targetUBR（[SPIKE] lcu.url/sha1 建议人工补或由 Catalog 详情页解析增强）
+          $pl = Get-Content patchlist.json | ConvertFrom-Json
+          $pl.branches.$branch.targetUBR = $env:NEWUBR
+          $pl | ConvertTo-Json -Depth 5 | Set-Content patchlist.json
+          git config user.email "bot@github.com"
+          git config user.name "update-bot"
+          git add patchlist.json
+          git commit -m "chore: bump $branch targetUBR -> $env:NEWUBR"
+          git push
+          # 触发 build（自动触发默认仅上传 Release；R2/OneDrive 由手动 dispatch 控制）
+          gh workflow run build_iso.yml --repo "${{ github.repository }}" -f branch=$branch
+          Write-Host "已触发 build_iso.yml (branch=$branch)"

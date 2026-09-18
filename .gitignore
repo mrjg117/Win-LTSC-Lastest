@@ -1,0 +1,18 @@
+# WorkBuddy 内部数据（记忆/自动化/skills），非项目源码，不入库
+.workbuddy/
+
+# 本地测试/侦察残留
+_recon.txt
+test-*.log
+wimhead.txt
+push-recon*.txt
+net-test.txt
+gitcfg.txt
+
+# 大型产物（ISO/分块/下载/挂载临时）绝不入库
+*.iso
+*.wim
+*.esd
+updates/
+logs/
+scratch/
