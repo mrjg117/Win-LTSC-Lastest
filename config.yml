@@ -14,7 +14,7 @@ baseline:
   # 取值来源：微软公开值 / 你下载源（itellyou/Archive）公示值
   sha256:
     "19044": "<填入 Windows 10 LTSC 2021 ISO 的 SHA256>"
-    "26100": "<填入 Windows 11 LTSC 2024 ISO 的 SHA256>"
+    "26100": "2CB21649590C8CF770CD93556596DFF4FD800F24D267A9BE9D9CE0EE9E03F5AC"
   chunk_size_mib: 1900     # 每块 ≤1.9GiB（GitHub Release 单文件硬限 2GiB）
 
 branches:
