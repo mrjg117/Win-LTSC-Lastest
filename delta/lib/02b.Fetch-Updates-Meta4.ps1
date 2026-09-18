@@ -23,6 +23,8 @@ if (-not (Test-Path $aria2)) { throw "未找到 aria2c: $aria2" }
 $manifest = Get-Content (Join-Path $WorkDir 'manifest.json') -Raw | ConvertFrom-Json
 $rawBuild = [int]$manifest.build
 $arch     = ($manifest.arch).ToString().ToLower()   # x64 / arm64 / x86
+# 兜底：01 若因故未识别出 arch，meta4 文件名会变成 script_<build>_.meta4 而必然找不到
+if ($arch -notmatch '^(x64|x86|arm64)$') { $arch = 'x64'; Log "WARN manifest.arch 异常，兜底取 x64" }
 
 # ---- build 映射（严格照抄 Start.cmd，meta4 文件名用映射后的值） ----
 $build = $rawBuild
@@ -60,6 +62,10 @@ function Invoke-Meta4($metaRel, $lang) {
 
 # ---- 1) 主补丁（LCU/SSU） ----
 $metaFile = "Scripts\script_$($build)_$($arch).meta4"
+# 主补丁 meta4 是必需项：缺失就立刻报清楚，不要静默跳过再在最后抛含糊的"没补丁"
+if (-not (Test-Path (Join-Path $WorkDir $metaFile))) {
+    throw "缺少主补丁 meta4: $metaFile（build 映射 $rawBuild -> $build, arch=$arch）"
+}
 if (-not (Invoke-Meta4 $metaFile $null)) {
     throw "meta4 下载失败（重试 5 次仍失败）: $metaFile"
 }

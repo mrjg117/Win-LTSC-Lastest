@@ -53,13 +53,17 @@ REM ---- 解压 baseline ISO 到分布文件夹（供 W10UI 集成补丁） ----
 echo [%date% %time%] 解压 baseline ISO -> ISO\ >> "%LOG%"
 bin\7z.exe x "baseline-%BRANCH%.iso" -o"ISO" -y >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
-REM ---- 释放磁盘：已解压，原 ISO 不再需要（runner D: 仅约 14GB）----
-del /f /q "baseline-%BRANCH%.iso" >> "%LOG%" 2>&1
+REM 注意：baseline-<分支>.iso 此刻**不能删**——01.Build-Manifest 还要从它里提取
+REM       sources\install.wim 做 DISM /Get-WimInfo 识别 build/arch。
 
 REM ---- 01 清单（改造A） ----
 echo [%date% %time%] [01] Build-Manifest >> "%LOG%"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\01.Build-Manifest.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
+REM ---- 释放磁盘（runner D: 仅约 14GB）----
+REM 01 已识别完 build/arch，baseline ISO（~5GB）与其解出的 install.wim（~4.5GB）都不再需要
+del /f /q "baseline-%BRANCH%.iso" >> "%LOG%" 2>&1
+if exist "iso-extract" rmdir /s /q "iso-extract"
 
 REM ---- 02 下载补丁（改造B） ----
 echo [%date% %time%] [02] Fetch-Updates >> "%LOG%"
