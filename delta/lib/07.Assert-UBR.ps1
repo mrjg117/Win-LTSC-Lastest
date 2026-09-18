@@ -23,7 +23,10 @@ $manifest = Get-Content (Join-Path $WorkDir 'manifest.json') -Raw | ConvertFrom-
 $targetUBR = $manifest.targetUBR
 $targetBuild = $manifest.build
 
-if (Test-Path $mount) { Dismount-WindowsImage -Path $mount -Discard -ErrorAction SilentlyContinue }
+if (Test-Path $mount) {
+    try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
+    catch { Write-Host "WARN 残留挂载点清理跳过（非挂载点）: $($_.Exception.Message)" }
+}
 New-Item -ItemType Directory -Force -Path $mount | Out-Null
 Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
 try {

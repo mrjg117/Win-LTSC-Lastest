@@ -19,7 +19,11 @@ $installWim = Join-Path $WorkDir 'ISO\sources\install.wim'   # [SPIKE] 路径随
 # install.wim 全量驱动池
 $pool = Join-Path $WorkDir 'assets\drivers'
 if (Test-Path $pool) {
-    if (Test-Path $mount) { Dismount-WindowsImage -Path $mount -Discard -ErrorAction SilentlyContinue }
+    if (Test-Path $mount) {
+        # [坑] 目录存在 ≠ 仍是挂载点；非挂载点 Dismount 会抛终止性 COMException
+        try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
+        catch { Log "WARN 残留挂载点清理跳过（非挂载点）: $($_.Exception.Message)" }
+    }
     New-Item -ItemType Directory -Force -Path $mount | Out-Null
     Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
     Log "注入驱动池(全量, 留盘): $pool"

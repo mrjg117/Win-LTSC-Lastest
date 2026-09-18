@@ -25,7 +25,10 @@ if (-not (Test-Path $appsDir)) { Log "无 assets\apps 目录，跳过"; return }
 
 $mount = Join-Path $WorkDir 'mount'
 $installWim = Join-Path $WorkDir 'ISO\sources\install.wim'   # [SPIKE] 路径随 W10UI 输出确认
-if (Test-Path $mount) { Dismount-WindowsImage -Path $mount -Discard -ErrorAction SilentlyContinue }
+if (Test-Path $mount) {
+    try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
+    catch { Log "WARN 残留挂载点清理跳过（非挂载点）: $($_.Exception.Message)" }
+}
 New-Item -ItemType Directory -Force -Path $mount | Out-Null
 Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
 Log "已挂载 install.wim -> $mount"

@@ -53,6 +53,8 @@ REM ---- 解压 baseline ISO 到分布文件夹（供 W10UI 集成补丁） ----
 echo [%date% %time%] 解压 baseline ISO -> ISO\ >> "%LOG%"
 bin\7z.exe x "baseline-%BRANCH%.iso" -o"ISO" -y >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
+REM ---- 释放磁盘：已解压，原 ISO 不再需要（runner D: 仅约 14GB）----
+del /f /q "baseline-%BRANCH%.iso" >> "%LOG%" 2>&1
 
 REM ---- 01 清单（改造A） ----
 echo [%date% %time%] [01] Build-Manifest >> "%LOG%"
@@ -77,6 +79,11 @@ REM        其是否消费我们 updates\ 下的本地 msu 取决于 W10UI.ini �
 echo [%date% %time%] 调用 W10UI.cmd 集成补丁 >> "%LOG%"
 cmd /c W10UI.cmd >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
+REM ---- 释放磁盘 ----
+REM 1) W10UI 自己封装的 ISO（约 7.9GB）与最终结果无关：后续 oscdimg 会基于 ISO\ 重新封装
+REM 2) patch\ 里的补丁包已集成进 install.wim，不再需要
+del /f /q *.iso >> "%LOG%" 2>&1
+if exist "patch" rmdir /s /q "patch"
 
 REM ---- 03 VC++ 注入（扩展E） ----
 echo [%date% %time%] [03] Integrate-VCpp >> "%LOG%"

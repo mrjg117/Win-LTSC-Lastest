@@ -20,7 +20,13 @@ $redist = Join-Path $WorkDir 'assets\redist'
 if (-not (Test-Path $redist)) { Log "无 redist 目录，跳过 VC++ 注入"; return }
 
 $installWim = Join-Path $WorkDir 'ISO\sources\install.wim'   # [SPIKE] 路径随 W10UI 输出确认
-if (Test-Path $mount) { Dismount-WindowsImage -Path $mount -Discard -ErrorAction SilentlyContinue }
+if (Test-Path $mount) {
+    # [坑] 上一阶段 -Save 卸载后 $mount 目录仍在，但已非挂载点；
+    #      此时再 Dismount 会抛 COMException "The request is not supported."，
+    #      且 -ErrorAction SilentlyContinue 挡不住（DISM cmdlet 抛的是终止错误）。
+    try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
+    catch { Log "WARN 残留挂载点清理跳过（非挂载点）: $($_.Exception.Message)" }
+}
 New-Item -ItemType Directory -Force -Path $mount | Out-Null
 Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
 Log "已挂载 install.wim -> $mount"

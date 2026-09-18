@@ -112,6 +112,8 @@ jobs:
           $expected = $m.Groups[1].Value
           if ($actual -ne $expected) { throw "baseline SHA256 不符! 期望 $expected 实际 $actual" }
           Write-Host "baseline SHA256 OK: $actual"
+          # 释放磁盘：分块与解压目录已无用（runner D: 仅约 14GB）
+          Remove-Item chunks, baseline_out -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: 运行 Patch.cmd（A→B→W10UI→E→D）
         if: env.SKIP != '1'
