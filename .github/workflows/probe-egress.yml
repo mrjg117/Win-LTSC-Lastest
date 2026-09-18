@@ -1,0 +1,24 @@
+name: Probe egress (which ISO hosts reachable from runner)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test DNS + HTTPS reachability of candidate ISO hosts
+        run: |
+          for h in drive.massgrave.dev massgrave.dev \
+                   oemsoc.download.prss.microsoft.com \
+                   software-static.download.prss.microsoft.com \
+                   archive.org; do
+            echo "=== $h ==="
+            if getent hosts "$h" >/dev/null 2>&1; then
+              echo "DNS_OK $(getent hosts $h | awk '{print $1}' | head -1)"
+            else
+              echo "DNS_FAIL (no address associated with hostname)"
+            fi
+            code=$(curl -s -o /dev/null -w '%{http_code}' -I --max-time 25 "https://$h/" 2>/dev/null || echo "CURL_ERR")
+            echo "HTTPS_HEAD=$code"
+          done
