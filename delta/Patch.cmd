@@ -9,6 +9,15 @@ setlocal EnableExtensions EnableDelayedExpansion
 set "WORKDIR=%~dp0"
 cd /d "%WORKDIR%"
 
+REM ---- 传给 PowerShell 的 WorkDir 必须去掉尾部反斜杠 ----
+REM [关键] Windows 命令行解析(CommandLineToArgvW) 把 \" 视为转义引号：
+REM        -WorkDir "D:\x\src\" 的结束引号会被吃掉，其后 -BranchId "26100"
+REM        被吞进同一个参数 -> 脚本报 "missing mandatory parameters: BranchId"。
+REM        故另存一份去掉尾部反斜杠的 PSWORKDIR 专供 -File 传参；
+REM        WORKDIR 仍保留尾部反斜杠用于 "%WORKDIR%logs\..." 之类的路径拼接。
+set "PSWORKDIR=%WORKDIR:~0,-1%"
+if "%PSWORKDIR%"=="" set "PSWORKDIR=%WORKDIR%"
+
 REM ---- 管理员校验 ----
 net session >nul 2>&1
 if %errorlevel% neq 0 (
@@ -32,12 +41,12 @@ echo [%date% %time%] Patch.cmd 开始 branch=%BRANCH% > "%LOG%"
 
 REM ---- 00 预检 fail-fast ----
 echo [%date% %time%] [00] 预检 >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\00.Precheck.ps1" -WorkDir "%WORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\00.Precheck.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 REM ---- 99 强制 W10UI.ini 两行（在 W10UI 前） ----
 echo [%date% %time%] [99] 强制 ini >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\99.Force-W10UI-Ini.ps1" -WorkDir "%WORKDIR%" >> "%LOG%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\99.Force-W10UI-Ini.ps1" -WorkDir "%PSWORKDIR%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 REM ---- 解压 baseline ISO 到分布文件夹（供 W10UI 集成补丁） ----
@@ -47,12 +56,12 @@ if errorlevel 1 goto :fail
 
 REM ---- 01 清单（改造A） ----
 echo [%date% %time%] [01] Build-Manifest >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\01.Build-Manifest.ps1" -WorkDir "%WORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\01.Build-Manifest.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 REM ---- 02 下载补丁（改造B） ----
 echo [%date% %time%] [02] Fetch-Updates >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\02.Fetch-Updates.ps1" -WorkDir "%WORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\02.Fetch-Updates.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 REM ---- 上游 W10UI.cmd 集成补丁到 install.wim ----
@@ -64,32 +73,32 @@ if errorlevel 1 goto :fail
 
 REM ---- 03 VC++ 注入（扩展E） ----
 echo [%date% %time%] [03] Integrate-VCpp >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\03.Integrate-VCpp.ps1" -WorkDir "%WORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\03.Integrate-VCpp.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 REM ---- 04 驱动注入 ----
 echo [%date% %time%] [04] Integrate-Drivers >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\04.Integrate-Drivers.ps1" -WorkDir "%WORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\04.Integrate-Drivers.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 REM ---- 05 应用预装（仅 Win11） ----
 echo [%date% %time%] [05] Integrate-Apps >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\05.Integrate-Apps.ps1" -WorkDir "%WORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\05.Integrate-Apps.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 REM ---- 06 组件精简 ----
 echo [%date% %time%] [06] Patch-Components >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\06.Patch-Components.ps1" -WorkDir "%WORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\06.Patch-Components.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 REM ---- 07 断言（改造D，失败即中止，不留半成品） ----
 echo [%date% %time%] [07] Assert-UBR >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\07.Assert-UBR.ps1" -WorkDir "%WORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\07.Assert-UBR.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 REM ---- 08 烤入自动应答 + PostSetup ----
 echo [%date% %time%] [08] Bake-Image >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\08.Bake-Image.ps1" -WorkDir "%WORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\08.Bake-Image.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 REM ---- 封装最终 ISO ----
