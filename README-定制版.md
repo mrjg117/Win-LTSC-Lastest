@@ -48,7 +48,12 @@ ISO 被 7z 分卷（≤1.9GiB）上传到仓库 `baseline` Release；工作流�
 
 ## 四、三端存储与保留数
 
-- **Release**：单文件硬限 2 GiB → ISO 自动 7z 分卷；资产免费、无过期、无带宽费。
+- **Release**：单文件硬限 2 GiB → 成品 ISO 自动切成 `WinLTSC-<分支>.part001…`（每片 ≤1.9GiB，逐片上传后即刻删除以控磁盘）；资产免费、无过期、无带宽费。
+  取用：把全部 `.partNNN` 下到同一目录后执行
+  ```bat
+  copy /b WinLTSC-26100.part* WinLTSC-26100.iso
+  ```
+  （baseline 原始 ISO 仍是传统 7z 分卷 `baseline-<分支>.7z.001…`，用 `7z x baseline-<分支>.7z.001` 解。）
 - **R2 / OneDrive**：整文件直传；保留数 `KEEP_R2` / `KEEP_ONEDRIVE` 独立（R2 免费额度小，默认关，开时调 1~2）。
 - 三端各自 `prune` 到保留数，旧的自动删。
 
