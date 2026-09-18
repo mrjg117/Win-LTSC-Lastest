@@ -138,6 +138,13 @@ jobs:
           Remove-Item src/ISO -Recurse -Force -ErrorAction SilentlyContinue
           if ($env:DO_RELEASE -eq 'true') {
             $logs = @(Get-ChildItem src/logs -Filter *.log -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+            # 幂等：同月同 UBR 重跑会撞同名 tag（上次的失败运行也留下过空壳 Release），先删再建
+            gh release view "$tag" --repo "${{ github.repository }}" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "已存在同名 Release $tag -> 删除后重建（幂等重跑）"
+              gh release delete "$tag" --repo "${{ github.repository }}" --yes
+              gh api --method DELETE "/repos/${{ github.repository }}/git/refs/tags/$tag" 2>$null
+            }
             gh release create "$tag" --repo "${{ github.repository }}" --title "$tag" --notes "branch=${{ matrix.branch }} | upstream_commit=$env:UPSTREAM_COMMIT | UBR=$ubr | 见 manifest.json" @logs src/manifest.json
           }
 
@@ -148,10 +155,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           # 逐片生成 -> 上传 -> 立即删除，避免 ISO(7.9GB)+全部分片(~7.9GB) 同时占盘撑爆 runner
-          $iso = Get-Item "out/WinLTSC-${{ matrix.branch }}.iso"
+          # [关键] Patch.cmd 在 src/ 下执行，产物落在 src/out/；本步工作目录是仓库根，必须带 src/ 前缀
+          $isoPath = "src/out/WinLTSC-${{ matrix.branch }}.iso"
+          if (-not (Test-Path $isoPath)) {
+            Write-Host "src 下的 out 目录内容："
+            Get-ChildItem src/out -Force -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Length) $($_.Name)" }
+            Write-Host "src 下的子目录：$((Get-ChildItem src -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ', ')"
+            throw "最终 ISO 未生成：$isoPath"
+          }
+          $iso = Get-Item $isoPath
           $size = $iso.Length
+          Write-Host "ISO size = $([math]::Round($size/1GB,2)) GB"
           $chunk = 1900L * 1024L * 1024L
           $buf = New-Object byte[] (16777216)
+          New-Item -ItemType Directory -Force -Path out | Out-Null
           $idx = 1
           $fs = [System.IO.File]::OpenRead($iso.FullName)
           try {
@@ -169,12 +186,29 @@ jobs:
                 }
               } finally { $out.Close() }
               Write-Host "upload $name ($([math]::Round($written/1MB,1)) MB)"
-              gh release upload "$env:TAG" $name --repo "${{ github.repository }}" --clobber
+              $ok = $false
+              for ($i = 1; $i -le 3 -and -not $ok; $i++) {
+                gh release upload "$env:TAG" $name --repo "${{ github.repository }}" --clobber
+                if ($LASTEXITCODE -eq 0) { $ok = $true } else { Write-Host "第 $i 次上传失败，重试…"; Start-Sleep -Seconds 10 }
+              }
+              if (-not $ok) { throw "分片 $name 上传失败（已重试 3 次）" }
               Remove-Item $name -Force
               $idx++
             }
           } finally { $fs.Close() }
-          Write-Host "共上传 $($idx - 1) 片"
+          $count = $idx - 1
+          Write-Host "共上传 $count 片"
+          $expected = [math]::Ceiling($size / $chunk)
+          if ($count -ne $expected) { throw "片数校验失败：期望 $expected 片，实际 $count 片" }
+          # 校验 Release 资产数与 part 数一致
+          $assets = (gh api "repos/${{ github.repository }}/releases/tags/$env:TAG" | ConvertFrom-Json).assets | Where-Object { $_.name -like "*.part*" }
+          Write-Host "Release 上的 part 资产数：$($assets.Count)"
+          if ($assets.Count -lt $expected) { throw "Release 资产缺失：期望 $expected 个 part，实际 $($assets.Count) 个" }
+          # R2 / OneDrive 通道若开启则需保留 ISO；否则删掉释放磁盘
+          if ($env:DO_R2 -ne 'true' -and $env:DO_ONEDRIVE -ne 'true') {
+            Remove-Item $isoPath -Force
+            Write-Host "已删除本地 ISO，释放 $([math]::Round($size/1GB,2)) GB"
+          }
 
       - name: 安装 rclone（R2 / OneDrive 通道）
         if: (env.DO_R2 == 'true' || env.DO_ONEDRIVE == 'true') && env.SKIP != '1'
@@ -197,7 +231,7 @@ jobs:
           RCLONE_CONFIG_R2_REGION: auto
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          rclone copy "out\WinLTSC-${{ matrix.branch }}.iso" "r2:$env:R2_BUCKET/iso-${{ matrix.branch }}-$env:TAG/"
+          rclone copy "src\out\WinLTSC-${{ matrix.branch }}.iso" "r2:$env:R2_BUCKET/iso-${{ matrix.branch }}-$env:TAG/"
 
       - name: 上传 OneDrive
         if: env.DO_ONEDRIVE == 'true' && env.SKIP != '1'
@@ -208,7 +242,7 @@ jobs:
           $dir = "$env:USERPROFILE\.config\rclone"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           [IO.File]::WriteAllBytes("$dir\rclone.conf", [Convert]::FromBase64String($env:ONEDRIVE_RCLONE_CONF_B64))
-          rclone copy "out\WinLTSC-${{ matrix.branch }}.iso" "onedrive:WinLTSC/iso-${{ matrix.branch }}-$env:TAG/"
+          rclone copy "src\out\WinLTSC-${{ matrix.branch }}.iso" "onedrive:WinLTSC/iso-${{ matrix.branch }}-$env:TAG/"
 
       - name: prune Release（保留 KEEP_RELEASE 个）
         if: env.DO_RELEASE == 'true'
