@@ -73,7 +73,12 @@ jobs:
         shell: bash
         run: |
           cp -r self/delta/* src/
+          # 根级配置文件也要进 src：delta/lib/*.ps1 是按 $WorkDir(=src) 读取的
+          cp -f self/patchlist.json src/patchlist.json || true
+          cp -f self/config.yml src/config.yml || true
           rm -f src/.github/workflows/update-meta4.yml || true
+          echo "--- src 顶层文件 ---"
+          ls -1 src/
 
       - name: cron 去重（仅每月兜底，本月已构建则跳过）
         if: github.event_name == 'schedule'

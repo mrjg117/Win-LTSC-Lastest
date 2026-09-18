@@ -105,4 +105,12 @@ exit /b 0
 
 :fail
 echo [FATAL] 构建失败，详见 %LOG%
+REM ---- 失败时把完整日志打到 stdout，否则 Actions 里看不到任何线索 ----
+if exist "%LOG%" (
+    echo ---- Patch.log 开始 ----
+    type "%LOG%"
+    echo ---- Patch.log 结束 ----
+) else (
+    echo [WARN] 日志文件不存在: %LOG%
+)
 exit /b 1
