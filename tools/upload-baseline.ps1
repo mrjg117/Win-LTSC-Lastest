@@ -34,8 +34,8 @@ Write-Host "ISO SHA256: $hash"
 Write-Host ">>> 请核对微软公开值 / 你下载源公示值，一致后再把此值填入 config.yml 的 baseline.sha256.$Branch"
 Write-Host "=" * 60
 
-# 2) 7z 分卷
-$base = [IO.Path]::GetFileNameWithoutExtension($IsoPath)
+# 2) 7z 分卷（卷名必须含分支号，build_iso.yml 按 *$branch.7z.* 匹配；否则拉基线时找不到）
+$base = "baseline-$Branch"
 $vol = "$base.7z"
 & 7z a -v${ChunkMiB}m $vol $IsoPath
 if ($LASTEXITCODE -ne 0) { throw "7z 分卷失败（本机需安装 7-Zip 且在 PATH）" }
