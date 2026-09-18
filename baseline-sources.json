@@ -1,14 +1,10 @@
 {
   "19044": {
-    "isoName": "zh-cn_windows_10_enterprise_ltsc_2021_x64_dvd_<微软原版文件名哈希后缀>.iso",
+    "isoName": "zh-cn_windows_10_enterprise_ltsc_2021_x64_dvd_033b7312.iso",
     "sources": [
       {
-        "name": "archive.org/@TheBobPony",
-        "url": "REPLACE_WITH_ARCHIVE_ORG_DIRECT_ISO_URL"
-      },
-      {
-        "name": "next.itellyou.cn",
-        "url": "REPLACE_WITH_ITELLYOU_DIRECT_ISO_URL"
+        "name": "massgrave (Microsoft MVS CDN mirror)",
+        "url": "https://drive.massgrave.dev/zh-cn_windows_10_enterprise_ltsc_2021_x64_dvd_033b7312.iso"
       }
     ]
   },
@@ -16,12 +12,8 @@
     "isoName": "zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso",
     "sources": [
       {
-        "name": "archive.org/@TheBobPony",
-        "url": "REPLACE_WITH_ARCHIVE_ORG_DIRECT_ISO_URL"
-      },
-      {
-        "name": "next.itellyou.cn",
-        "url": "REPLACE_WITH_ITELLYOU_DIRECT_ISO_URL"
+        "name": "massgrave (Microsoft MVS CDN mirror)",
+        "url": "https://drive.massgrave.dev/zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso"
       }
     ]
   }

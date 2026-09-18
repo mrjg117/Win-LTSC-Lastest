@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-从权威分发（archive.org / itellyou）拉取官方 LTSC ISO，逐字节校验 SHA256，
-7z 分包（<=1.9GiB）后上传到本仓库 baseline Release。
+从权威分发拉取官方 LTSC ISO，逐字节校验 SHA256，7z 分包（<=1.9GiB）后
+上传到本仓库 baseline Release。
 
 设计要点：
 - 期望 SHA256 的单一真相源 = 仓库 config.yml 的 baseline.sha256.<分支>。
   拉取后强制比对，不符即中止（满足"权威分发必须校验微软公开值"）。
 - 分卷命名必须含分支号：baseline-<分支>.7z.001 ...（build_iso.yml 按 *$branch.7z.* 匹配）。
-- 单一来源 URL 在 baseline-sources.json（含 REPLACE 占位符的源会被跳过）。
-- 已存在于 baseline 且非 --force 的分支直接跳过（避免重复拉 5GB）。
+- 单一来源 URL 在 baseline-sources.json。
+- 磁盘约束：Actions runner 只有 ~14GB，两个 ISO 各 ~5GB，不能并发占盘。
+  因此改为【逐分支】：下载→校验→分包→上传→立即删盘，再处理下一分支。
+- 单分支失败不连累其它分支（记录失败，继续下一个；全部失败才退出非 0）。
 - manifest 跨次合并：先下载已有 baseline.manifest.json 保留其它分支，再写回。
 """
 import os
@@ -64,16 +66,34 @@ def sha256_file(p):
     return h.hexdigest()
 
 
-env = dict(os.environ, GH_TOKEN=TOKEN)
+def gh(*args):
+    return subprocess.run(
+        ["gh", *args, "--repo", REPO],
+        capture_output=True, text=True,
+        env=dict(os.environ, GH_TOKEN=TOKEN),
+    )
+
+
+def ensure_release():
+    if gh("release", "view", "baseline").returncode != 0:
+        gh("release", "create", "baseline", "--title", "baseline",
+           "--notes", "官方 LTSC ISO 分卷（权威分发拉取，SHA256 见 baseline.manifest.json / SHA256SUMS）")
+
+
+def write_manifest_and_sums(manifest):
+    json.dump(manifest, open("baseline.manifest.json", "w", encoding="utf-8"),
+              ensure_ascii=False, indent=2)
+    sums = []
+    for _b, ed in manifest["editions"].items():
+        for v, h in ed["volumeSha256"].items():
+            sums.append(f"{h}  {v}")
+    open("SHA256SUMS", "w", encoding="utf-8").write("\n".join(sums) + "\n")
+
 
 # 载入已有 manifest（保留其它分支的条目）
 manifest = {"generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "editions": {}}
 try:
-    subprocess.run(
-        ["gh", "release", "download", "baseline", "--repo", REPO,
-         "--pattern", "baseline.manifest.json", "--dir", "."],
-        check=True, env=env, capture_output=True,
-    )
+    gh("release", "download", "baseline", "--pattern", "baseline.manifest.json", "--dir", ".")
     old = json.load(open("baseline.manifest.json", encoding="utf-8-sig"))
     manifest["editions"] = dict(old.get("editions", {}))
     print("已载入已有 manifest（保留其它分支）")
@@ -81,6 +101,7 @@ except Exception as e:  # noqa: BLE001
     print("无已有 manifest（首次上传）:", e)
 
 branches = ["19044", "26100"] if BRANCH_SEL == "all" else [BRANCH_SEL]
+failed = []
 
 for b in branches:
     if (not FORCE) and b in manifest["editions"]:
@@ -89,13 +110,15 @@ for b in branches:
 
     exp = expected_sha(b)
     if not exp:
-        print(f"ERROR: config.yml baseline.sha256.{b} 仍是占位符，请先填微软公开 SHA256（权威分发必须校验）")
-        sys.exit(1)
+        print(f"ERROR: config.yml baseline.sha256.{b} 仍是占位符，请先填微软公开 SHA256")
+        failed.append(b)
+        continue
 
     info = src.get(b)
     if not info:
         print(f"ERROR: baseline-sources.json 缺少 {b}")
-        sys.exit(1)
+        failed.append(b)
+        continue
 
     iso = info["isoName"]
     sources = [s for s in info.get("sources", []) if "REPLACE" not in s["url"]]
@@ -104,6 +127,7 @@ for b in branches:
         sources = f if f else sources
 
     ok = False
+    used = None
     for s in sources:
         print("尝试源:", s["name"], s["url"])
         try:
@@ -115,12 +139,14 @@ for b in branches:
             print("  失败:", e)
     if not ok:
         print(f"ERROR: {b} 所有源下载失败")
-        sys.exit(1)
+        failed.append(b)
+        continue
 
     act = sha256_file("dl_" + iso)
     if act.lower() != exp.lower():
         print(f"ERROR: {b} SHA256 不符! 期望 {exp} 实际 {act}")
-        sys.exit(1)
+        failed.append(b)
+        continue
     print(f"{b} SHA256 校验通过: {act}")
 
     subprocess.run(["7z", "a", "-v1900m", f"baseline-{b}.7z", "dl_" + iso], check=True)
@@ -135,30 +161,36 @@ for b in branches:
         "volumeSha256": vsha,
         "volumeMiB": 1900,
     }
-    print(f"{b} 分卷完成: {len(vols)} 块")
+    write_manifest_and_sums(manifest)
 
-json.dump(manifest, open("baseline.manifest.json", "w", encoding="utf-8"),
-          ensure_ascii=False, indent=2)
+    ensure_release()
+    files = vols + ["baseline.manifest.json", "SHA256SUMS"]
+    r = gh("release", "upload", "baseline", "--clobber", *files)
+    if r.returncode != 0:
+        print("UPLOAD FAIL:", r.stderr)
+        # 回滚 manifest 中本分支，避免下次误判已存在
+        manifest["editions"].pop(b, None)
+        write_manifest_and_sums(manifest)
+        failed.append(b)
+    else:
+        print(f"{b} 上传完成: {len(vols)} 块 -> baseline Release")
 
-sums = []
-for _b, ed in manifest["editions"].items():
-    for v, h in ed["volumeSha256"].items():
-        sums.append(f"{h}  {v}")
-open("SHA256SUMS", "w", encoding="utf-8").write("\n".join(sums) + "\n")
+    # 立即删盘，释放空间给下一分支（runner 仅 ~14GB）
+    try:
+        os.remove("dl_" + iso)
+    except OSError:
+        pass
+    for v in vols:
+        try:
+            os.remove(v)
+        except OSError:
+            pass
 
-r = subprocess.run(["gh", "release", "view", "baseline", "--repo", REPO],
-                   capture_output=True, env=env)
-if r.returncode != 0:
-    subprocess.run(
-        ["gh", "release", "create", "baseline", "--repo", REPO, "--title", "baseline",
-         "--notes", "官方 LTSC ISO 分卷（权威分发拉取，SHA256 见 baseline.manifest.json / SHA256SUMS）"],
-        check=True, env=env,
-    )
+if not manifest["editions"]:
+    print("ERROR: 没有任何分支成功")
+    sys.exit(1)
 
-files = []
-for _b in manifest["editions"]:
-    files += sorted(glob.glob(f"baseline-{_b}.7z.*"))
-files += ["baseline.manifest.json", "SHA256SUMS"]
-subprocess.run(["gh", "release", "upload", "baseline", "--repo", REPO, "--clobber", *files],
-               check=True, env=env)
+print("DONE. 成功分支:", list(manifest["editions"].keys()), "失败:", failed)
+if failed:
+    sys.exit(1)
 print("UPLOAD DONE")
