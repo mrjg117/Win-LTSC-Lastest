@@ -3,7 +3,7 @@ name: Fetch Baseline ISO (authoritative mirror)
 # 手动触发：从权威分发（archive.org / itellyou）拉取官方 LTSC ISO，
 # 校验 SHA256（单一真相源 = config.yml 的 baseline.sha256.<分支>），
 # 7z 分包（<=1.9GiB）后上传到本仓库 baseline Release。
-# 命名契约：baseline-<分支>.7z.001 ...（build_iso.yml 按 *$branch.7z.* 匹配）。
+# 命名契约：<微软原版ISO名>.7z.001 ...（build_iso.yml 按 *<isoName>.7z.* 匹配）。
 
 on:
   workflow_dispatch:
