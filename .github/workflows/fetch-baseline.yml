@@ -32,7 +32,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          trap 'echo "---- 失败于第 $LINENO 行 ----"' ERR
+          trap 'echo "---- 失败: $BASH_COMMAND ----"' ERR
 
           CHUNK_MIB="$(awk '/^baseline:/{f=1} f && /chunk_mib:/{print $2; exit}' config.yml)"
           : "${CHUNK_MIB:=1900}"
@@ -54,11 +54,13 @@ jobs:
 
           NOTES=$'官方 LTSC ISO 原版镜像（未改装，微软原始发行版）。\n\n分片沿用微软原名：<iso 原名>.part1 / .part2 / … 为 RAW 字节切片（无压缩、非 7z），顺序拼接即为原 ISO。\n\n下载后把同一分支的全部分片与 merge.cmd 放进同一目录，双击 merge.cmd 即自动重组并校验 SHA256（期望值已内嵌在 merge.cmd 中，无需另找校验文件）。'
 
-          if gh release view baseline --repo "$REPO" >/dev/null 2>&1; then
-            gh release edit baseline --repo "$REPO" --notes "$NOTES"
-          else
-            gh release create baseline --repo "$REPO" --title baseline --notes "$NOTES"
-          fi
+          # 幂等：每一波上传前调用一次 —— 有则引用、无则现建。
+          # 刻意不在这里提前建：后面的下载要十几分钟，中途 release 若被删（人为清理/误删），
+          # 提前建就是白建，等到上传时才发现 404。放在上传前一刻，危险窗口≈0。
+          ensure_release() {
+            gh release view baseline --repo "$REPO" >/dev/null 2>&1 \
+              || gh release create baseline --repo "$REPO" --title baseline --notes "$NOTES"
+          }
 
           EXP_LINES=""
           while IFS=$'\t' read -r BR URL SHA; do
@@ -73,6 +75,7 @@ jobs:
             rm -f "$ISO".part*
             split -b "${CHUNK_MIB}M" -a 1 --numeric-suffixes=1 "$ISO" "$ISO.part"
             ls -l "$ISO".part*
+            ensure_release
             gh release upload baseline --repo "$REPO" --clobber "$ISO".part*
             rm -f "$ISO" "$ISO".part*
             EXP_LINES="${EXP_LINES}set \"EXP_${ISO}=${SHA}\""$'\n'
@@ -82,6 +85,7 @@ jobs:
           sed -n '1,/===EXPECTED_HASHES_START===/p' merge.cmd > dist/merge.cmd
           printf '%s' "$EXP_LINES" >> dist/merge.cmd
           sed -n '/===EXPECTED_HASHES_END===/,$p' merge.cmd >> dist/merge.cmd
+          ensure_release
           gh release upload baseline --repo "$REPO" --clobber dist/merge.cmd
           rm -rf dist
 
