@@ -1,15 +1,15 @@
 name: Fetch Baseline ISO (authoritative mirror)
 
-# 手动触发：从唯一权威源下载两个官方 LTSC ISO -> SHA256 校验 -> RAW 顺序切分
-# （每片 <= config.yml 的 baseline.chunk_mib，无压缩）-> 生成内嵌哈希的 merge.cmd
-# -> 上传本仓库 baseline Release。
+# 手动触发：按 config.yml 的 baseline.sources 逐条下载官方原版 ISO
+#   -> SHA256 校验 -> RAW 顺序切分（每片 <= baseline.chunk_mib，无压缩）
+#   -> 生成内嵌哈希的 merge.cmd -> 上传本仓库 baseline Release。
 #
-# baseline Release 的内容固定就两样，别无他物（多余资产会被本工作流清掉）：
-#   1) <微软原版ISO名>.part1 / .part2 / ...    RAW 字节切片，copy /b 可直接拼回
-#   2) merge.cmd                              下载方双击即自动重组 + 校验 SHA256
+# 唯一真相源：下载地址与 SHA256 全部写在 config.yml 的 baseline.sources，别处不再重复。
+# 文件名 = URL 末段（就是微软原版名），不另立命名规则；各源域名可不同，逐条完整写。
 #
-# 单一真相源：期望 SHA256 与分片大小都在 config.yml 的 baseline 段，本文件不复制。
-# 唯一权威源：download.testip.xyz
+# baseline Release 内容固定两样（其余残留资产会被本工作流清掉）：
+#   1) <iso 原名>.part1 / .part2 / ...   RAW 字节切片，可直接 copy /b 拼回
+#   2) merge.cmd                          下载方双击即自动重组 + 校验 SHA256
 
 on:
   workflow_dispatch:
@@ -32,51 +32,58 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          trap 'echo "---- 失败于第 $LINENO 行 ----"' ERR
 
-          ISO10="zh-cn_windows_10_enterprise_ltsc_2021_x64_dvd_033b7312.iso"
-          ISO11="zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso"
-          SRC="https://download.testip.xyz/windows"
-
-          CHUNK_MIB="$(grep -oP 'chunk_mib:\s*\K[0-9]+' config.yml || true)"
+          CHUNK_MIB="$(awk '/^baseline:/{f=1} f && /chunk_mib:/{print $2; exit}' config.yml)"
           : "${CHUNK_MIB:=1900}"
           echo "分片大小 = ${CHUNK_MIB} MiB"
 
-          sha_of() {
-            grep -oP "\"$1\"\s*:\s*\"\K[0-9a-fA-F]{64}" config.yml | tr '[:lower:]' '[:upper:]'
-          }
+          # 解析 config.yml 的 baseline.sources -> TSV：branch<TAB>url<TAB>sha256
+          ROWS="$(awk '
+            /^[a-zA-Z]/ { inb = ($1 == "baseline:") }
+            inb && /- branch:/ { if (b != "") print b "\t" u "\t" s; b = $3; u = ""; s = "" }
+            inb && /^[[:space:]]+url:/    { u = $2 }
+            inb && /^[[:space:]]+sha256:/ { s = $2 }
+            END { if (b != "") print b "\t" u "\t" s }
+          ' config.yml)"
+          if [ -z "$ROWS" ]; then
+            echo "ERROR: config.yml 的 baseline.sources 为空或无法解析"
+            exit 1
+          fi
+          echo "清单条数 = $(printf '%s\n' "$ROWS" | grep -c .)"
 
-          if ! gh release view baseline --repo "$REPO" >/dev/null 2>&1; then
-            gh release create baseline --repo "$REPO" --title baseline \
-              --notes "官方 LTSC ISO 原版镜像（RAW 切分）。把全部 .partN 与 merge.cmd 下到同一目录，双击 merge.cmd 自动重组并校验 SHA256。"
+          NOTES=$'官方 LTSC ISO 原版镜像（未改装，微软原始发行版）。\n\n分片沿用微软原名：<iso 原名>.part1 / .part2 / … 为 RAW 字节切片（无压缩、非 7z），顺序拼接即为原 ISO。\n\n下载后把同一分支的全部分片与 merge.cmd 放进同一目录，双击 merge.cmd 即自动重组并校验 SHA256（期望值已内嵌在 merge.cmd 中，无需另找校验文件）。'
+
+          if gh release view baseline --repo "$REPO" >/dev/null 2>&1; then
+            gh release edit baseline --repo "$REPO" --notes "$NOTES"
+          else
+            gh release create baseline --repo "$REPO" --title baseline --notes "$NOTES"
           fi
 
-          fetch_one() {
-            local iso="$1" url="$2" branch="$3"
-            local exp
-            exp="$(sha_of "$branch")"
-            if [ -z "$exp" ]; then
-              echo "ERROR: config.yml 未配置 baseline.sha256.\"$branch\""
-              return 1
-            fi
+          EXP_LINES=""
+          while IFS=$'\t' read -r BR URL SHA; do
+            [ -z "$URL" ] && continue
+            BR="$(printf '%s' "$BR" | tr -d '"')"
+            SHA="$(printf '%s' "$SHA" | tr -d '"' | tr 'a-f' 'A-F')"
+            ISO="$(basename "$URL")"
             echo "=============================================================="
-            echo "[$branch] $iso"
-            curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o "$iso" "$url"
-            echo "$exp  $iso" | sha256sum -c -
-            rm -f "$iso".part*
-            split -b "${CHUNK_MIB}M" -a 1 --numeric-suffixes=1 "$iso" "$iso.part"
-            ls -l "$iso".part*
-            gh release upload baseline --repo "$REPO" --clobber "$iso".part*
-            rm -f "$iso" "$iso".part*
-          }
-
-          fetch_one "$ISO10" "$SRC/$ISO10" 19044
-          fetch_one "$ISO11" "$SRC/$ISO11" 26100
+            echo "[$BR] $ISO"
+            curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o "$ISO" "$URL"
+            echo "$SHA  $ISO" | sha256sum -c -
+            rm -f "$ISO".part*
+            split -b "${CHUNK_MIB}M" -a 1 --numeric-suffixes=1 "$ISO" "$ISO.part"
+            ls -l "$ISO".part*
+            gh release upload baseline --repo "$REPO" --clobber "$ISO".part*
+            rm -f "$ISO" "$ISO".part*
+            EXP_LINES="${EXP_LINES}set \"EXP_${ISO}=${SHA}\""$'\n'
+          done <<< "$ROWS"
 
           mkdir -p dist
           sed -n '1,/===EXPECTED_HASHES_START===/p' merge.cmd > dist/merge.cmd
-          printf 'set "EXP_%s=%s"\n' "$ISO10" "$(sha_of 19044)" "$ISO11" "$(sha_of 26100)" >> dist/merge.cmd
+          printf '%s' "$EXP_LINES" >> dist/merge.cmd
           sed -n '/===EXPECTED_HASHES_END===/,$p' merge.cmd >> dist/merge.cmd
           gh release upload baseline --repo "$REPO" --clobber dist/merge.cmd
+          rm -rf dist
 
           gh release view baseline --repo "$REPO" --json assets --jq '.assets[].name' | while read -r a; do
             [ -z "$a" ] && continue

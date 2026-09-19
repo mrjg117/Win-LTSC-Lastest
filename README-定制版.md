@@ -13,10 +13,10 @@
 
 ## 一、需要你填的占位（首次必做）
 
-1. **`config.yml` → `baseline.sha256`**：填两个官方 ISO 的真实 SHA256（从微软公开值或你下载源公示值核对）。
+1. **`config.yml` → `baseline.sources`**：源镜像清单，一条镜像一行（`branch` + 完整下载直链 + `sha256`）。**这是下载地址与哈希的唯一存放处**，工作流不重复写；产物构建份数也由这里的条数决定。
 2. **`config.yml` → `postsetup`**：首启脚本开关在此调（MAS / 关休眠 / 关预留空间 / 虚拟内存 / wsreset / 跑完自清），**改这些不必碰脚本**；`components`/`apps`/`drivers`/`storage`/`trigger` 也都在这里。
 3. **`patchlist.json` → 每分支 `targetUBR` / `lcu`(kb,url,sha1) / `ssu`**：每月 Patch Tuesday 后更新 `targetUBR` 与补丁直链+SHA1（check-updates 会自动 bump `targetUBR`，但 `lcu.url/sha1` 建议人工确认）。
-3. **Secrets**（仓库 Settings → Secrets，绝不进仓库文件）：
+4. **Secrets**（仓库 Settings → Secrets，绝不进仓库文件）：
    - 三端上传按需：`R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET`、`ONEDRIVE_RCLONE_CONF`（base64 编码的 rclone.conf）
    - `GITHUB_TOKEN` 由 Actions 自动提供，无需配置。
 
@@ -24,17 +24,18 @@
 
 ## 二、首次：拉取官方基线 ISO
 
-无需本机传封。到仓库 Actions 手动跑一次 **`Fetch Baseline ISO`** 工作流即可 —— 全部逻辑都在**工作流内**（纯 bash，无外部脚本），四步：
+无需本机传封。到仓库 Actions 手动跑一次 **`Fetch Baseline ISO`** 工作流即可 —— 全部逻辑都在**工作流内**（纯 bash，无外部脚本）：
 
-1. 从唯一权威源 `download.testip.xyz` 下载两个官方 LTSC ISO；
-2. 按 `config.yml` 的 `baseline.sha256` 校验 SHA256，不符即中止；
+1. 按 `config.yml` 的 `baseline.sources` 逐条下载官方 ISO（直链完整写、各源域名可不同、不做拼接；下载文件名 = URL 末段，即微软原版名）；
+2. 用清单里同一条的 `sha256` 校验，不符即中止；
 3. RAW 顺序字节切分（`baseline.chunk_mib`，默认 1900 MiB/片，无压缩）→ `<微软原版ISO名>.part1/2/3…`；
-4. 生成内嵌两 ISO 哈希的 `merge.cmd`，连同分块上传到 `baseline` Release，并清理该 Release 上的一切其它残留资产。
+4. 生成内嵌全部源镜像哈希的 `merge.cmd`，连同分块上传到 `baseline` Release，并清理该 Release 上的一切其它残留资产。
 
 产物固定只有两样：`<微软原版ISO名>.partN` 与 `merge.cmd`。
 取用：把 `merge.cmd` 和全部 `.partN` 下到同一目录，双击 `merge.cmd` 即自动 `copy /b` 重组 ISO 并核对 SHA256。
 
-> 期望哈希与分片大小的单一真相源 = `config.yml` 的 `baseline` 段；两个 ISO 的直链就写在工作流里（两行）。
+> **加镜像源 = 在 `config.yml` 的 `baseline.sources` 加一条**（该分支还需在 `patchlist.json` 有定义）：
+> 先跑 `Fetch Baseline ISO` 把它上传到 `baseline`，再跑 `Build ISO` —— 产物会自动多一份，全程无需改工作流。
 
 ---
 
@@ -42,7 +43,7 @@
 
 | 触发 | 说明 |
 |---|---|
-| **手动 `workflow_dispatch`** | 随时可跑；可指定分支、三端上传开关、各端保留数 |
+| **手动 `workflow_dispatch`** | 随时可跑；三端上传开关与各端保留数可调（**构建哪些分支由 `baseline.sources` 决定，不需要手选**） |
 | **每日 `check-updates`（事件驱动）** | 每日检测两分支最新累积更新 UBR；有新版本则自动 bump `patchlist.json` 并触发构建（默认仅传 Release） |
 | **每月第3周三兜底 cron** | `build_iso.yml` 内 `schedule`；运行前查本月是否已有 Release，**已构建则跳过**，避免与事件驱动重复 |
 
