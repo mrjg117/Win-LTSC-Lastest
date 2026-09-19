@@ -7,7 +7,7 @@
 设计要点：
 - 期望 SHA256 的单一真相源 = 仓库 config.yml 的 baseline.sha256.<分支>。
   拉取后强制比对，不符即中止（满足"权威分发必须校验微软公开值"）。
-- 分卷命名必须含分支号：baseline-<分支>.7z.001 ...（build_iso.yml 按 *$branch.7z.* 匹配）。
+- 分卷命名 = 微软原版 ISO 名：<isoName>.7z.001 ...（build_iso.yml 按 *<isoName>.7z.* 匹配）。
 - 单一来源 URL 在 baseline-sources.json。
 - 磁盘约束：Actions runner 只有 ~14GB，两个 ISO 各 ~5GB，不能并发占盘。
   因此改为【逐分支】：下载→校验→分包→上传→立即删盘，再处理下一分支。
@@ -149,8 +149,8 @@ for b in branches:
         continue
     print(f"{b} SHA256 校验通过: {act}")
 
-    subprocess.run(["7z", "a", "-v1900m", f"baseline-{b}.7z", "dl_" + iso], check=True)
-    vols = sorted(glob.glob(f"baseline-{b}.7z.*"))
+    subprocess.run(["7z", "a", "-v1900m", f"{iso}.7z", "dl_" + iso], check=True)
+    vols = sorted(glob.glob(f"{iso}.7z.*"))
     vsha = {v: sha256_file(v) for v in vols}
     manifest["editions"][b] = {
         "isoName": iso,

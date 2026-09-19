@@ -97,10 +97,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $branch = "${{ matrix.branch }}"
+          # baseline 7z 分卷以微软原版 ISO 名命名（见 fetch-baseline.py）；按分支映射到 iso 名
+          $isoName = @{ "19044" = "zh-cn_windows_10_enterprise_ltsc_2021_x64_dvd_033b7312.iso"; "26100" = "zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso" }[$branch]
           New-Item -ItemType Directory -Force -Path chunks | Out-Null
-          gh release download baseline --repo "${{ github.repository }}" --dir chunks --pattern "*$branch.7z.*"
-          $first = Get-ChildItem chunks -Filter "*$branch.7z.001" | Select-Object -First 1
-          if (-not $first) { throw "未找到 baseline 分块（请先用 tools/upload-baseline.ps1 上传官方 ISO 分卷）" }
+          gh release download baseline --repo "${{ github.repository }}" --dir chunks --pattern "*$isoName.7z.*"
+          $first = Get-ChildItem chunks -Filter "*$isoName.7z.001" | Select-Object -First 1
+          if (-not $first) { throw "未找到 baseline 分块（请先运行 fetch-baseline 上传官方 ISO 分卷）" }
           & src/bin/7z.exe x $first.FullName -obaseline_out | Out-Null
           $iso = Get-ChildItem baseline_out -Filter *.iso | Select-Object -First 1
           if (-not $iso) { throw "7z 重组未产出 ISO" }
