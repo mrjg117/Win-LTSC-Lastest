@@ -1,16 +1,16 @@
 name: Fetch Baseline ISO (authoritative mirror)
 
-# 手动触发：按 config.yml 的 baseline.sources 逐条用 aria2 走 BitTorrent 磁力下载官方原版 ISO
+# 手动触发：按 config.yml 的 baseline.sources 逐条用 axel 多线程 HTTP 下载官方原版 ISO
 #   -> SHA256 强校验 -> RAW 顺序切分（每片 <= baseline.chunk_mib，无压缩）
 #   -> 生成内嵌哈希的 merge.cmd -> 上传本仓库 baseline Release。
 #
-# 唯一真相源：磁力链接与 SHA256 全部写在 config.yml 的 baseline.sources，别处不再重复。
-# 产出文件名 = 该条源的 name 字段（契约命名：分片名、merge.cmd 键、成品 ISO 名都由它派生）。
-# 各源并行下载（互相独立，串行会撑爆 GitHub-hosted runner 的 6 小时硬上限）。
+# 唯一真相源：下载地址与 SHA256 全部写在 config.yml 的 baseline.sources，别处不再重复。
+# 产出文件名 = URL 末段（微软原版名）；分片名、merge.cmd 键、成品 ISO 名全部由它派生。
+# 各源并行下载（互相独立；串行会把两个 ISO 塞进同一个 6 小时硬上限里，必挂）。
 #
 # baseline Release 内容固定两样（其余残留资产会被本工作流清掉）：
-#   1) <name>.part1 / .part2 / ...   RAW 字节切片，可直接 copy /b 拼回
-#   2) merge.cmd                      下载方双击即自动重组 + 校验 SHA256
+#   1) <ISO 名>.part1 / .part2 / ...   RAW 字节切片，可直接 copy /b 拼回
+#   2) merge.cmd                        下载方双击即自动重组 + 校验 SHA256
 
 on:
   workflow_dispatch:
@@ -27,10 +27,10 @@ jobs:
       - name: Checkout（config.yml + merge.cmd 模板）
         uses: actions/checkout@v4
 
-      - name: 安装 aria2
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends aria2
+      - name: 安装 axel
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends axel
 
-      - name: 磁力下载 / 校验 / RAW 切分 / 上传 baseline
+      - name: 多线程下载 / 校验 / RAW 切分 / 上传 baseline
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -41,16 +41,17 @@ jobs:
 
           CHUNK_MIB="$(awk '/^baseline:/{f=1} f && /chunk_mib:/{print $2; exit}' config.yml)"
           : "${CHUNK_MIB:=1900}"
-          echo "分片大小 = ${CHUNK_MIB} MiB"
+          THREADS="$(awk '/^baseline:/{f=1} f && /threads:/{print $2; exit}' config.yml)"
+          : "${THREADS:=16}"
+          echo "分片大小 = ${CHUNK_MIB} MiB | 并发连接 = ${THREADS}"
 
-          # 解析 config.yml 的 baseline.sources -> TSV：branch<TAB>name<TAB>magnet<TAB>sha256
+          # 解析 config.yml 的 baseline.sources -> TSV：branch<TAB>url<TAB>sha256
           ROWS="$(awk '
             /^[a-zA-Z]/ { inb = ($1 == "baseline:") }
-            inb && /- branch:/ { if (b != "") print b "\t" n "\t" m "\t" s; b = $3; n = ""; m = ""; s = "" }
-            inb && /^[[:space:]]+name:/   { n = $2 }
-            inb && /^[[:space:]]+magnet:/ { m = $2 }
+            inb && /- branch:/ { if (b != "") print b "\t" u "\t" s; b = $3; u = ""; s = "" }
+            inb && /^[[:space:]]+url:/    { u = $2 }
             inb && /^[[:space:]]+sha256:/ { s = $2 }
-            END { if (b != "") print b "\t" n "\t" m "\t" s }
+            END { if (b != "") print b "\t" u "\t" s }
           ' config.yml)"
           if [ -z "$ROWS" ]; then
             echo "ERROR: config.yml 的 baseline.sources 为空或无法解析"
@@ -58,7 +59,7 @@ jobs:
           fi
           echo "清单条数 = $(printf '%s\n' "$ROWS" | grep -c .)"
 
-          NOTES=$'官方 LTSC ISO 原版镜像（未改装，微软原始发行版）。\n\n分片沿用原名：<name>.part1 / .part2 / … 为 RAW 字节切片（无压缩、非 7z），顺序拼接即为原 ISO。\n\n下载后把同一分支的全部分片与 merge.cmd 放进同一目录，双击 merge.cmd 即自动重组并校验 SHA256（期望值已内嵌在 merge.cmd 中，无需另找校验文件）。'
+          NOTES=$'官方 LTSC ISO 原版镜像（未改装，微软原始发行版）。\n\n分片沿用原名：<ISO 名>.part1 / .part2 / … 为 RAW 字节切片（无压缩、非 7z），顺序拼接即为原 ISO。\n\n下载后把同一分支的全部分片与 merge.cmd 放进同一目录，双击 merge.cmd 即自动重组并校验 SHA256（期望值已内嵌在 merge.cmd 中，无需另找校验文件）。'
 
           # 幂等：每一波上传前调用一次 —— 有则引用、无则现建。
           # 也容忍并发：多路同时现建时其中一个必然失败，视为「已被别的路建好」即可。
@@ -68,65 +69,49 @@ jobs:
             gh release view baseline --repo "$REPO" >/dev/null 2>&1
           }
 
-          # 单条源：磁力下载 -> 改回契约名 -> SHA256 -> RAW 切分 -> 上传分片
+          # 单条源：多线程下载 -> SHA256 -> RAW 切分 -> 上传分片
           fetch_one() {
-            local BR="$1" ISO="$2" MAGNET="$3" SHA="$4"
-            local WORK="dl/$BR" GOT
-            mkdir -p "$WORK"
+            local BR="$1" ISO="$2" URL="$3" SHA="$4"
             echo "=============================================================="
-            echo "[$BR] 磁力下载 -> $ISO   开始 $(date -u +%H:%M:%S)"
+            echo "[$BR] 下载 -> $ISO   开始 $(date -u +%H:%M:%S)"
 
-            # BitTorrent 三个必需/关键点：
-            #   --seed-time=0        下完立刻退出。不设会一直做种，job 永远不结束。
-            #   --bt-stop-timeout=N  连续 N 秒零速度即放弃。否则没 peer 时会干等到 6h 被砍，
-            #                        连失败原因都看不到。
-            #   刻意不用 --out：种子内部的真实文件名未必等于磁力里的 dn=，落地后自己改名最稳。
-            #
-            # 进度可见性（Actions 网页端实时日志）：
-            #   --show-console-readout=false  关掉 \r 自刷新那一行 —— 它在网页日志里只会挤成
-            #                                 一堆残影，看不出进度。
-            #   --summary-interval=15         改成每 15 秒定格打印一个进度块（含百分比/速度/ETA），
-            #                                 网页端滚动日志里一行行看得很清楚。
-            aria2c \
-              --dir="$WORK" \
-              --seed-time=0 \
-              --bt-stop-timeout=600 \
-              --enable-dht=true \
-              --bt-max-peers=100 \
-              --check-integrity=true \
-              --file-allocation=none \
-              --max-tries=0 --retry-wait=5 \
-              --show-console-readout=false \
-              --summary-interval=15 \
-              --human-readable=true \
-              --console-log-level=notice \
-              "$MAGNET"
+            # axel —— 轻量多线程 HTTP 下载器（apt 官方包，秒装，无编译）：
+            #   -n N  并发连接数（源站实测 Accept-Ranges: bytes，支持多连接分段）
+            #   -o F  直接落成契约文件名，省去事后改名
+            #   -a    简洁进度条，每秒刷新 —— 网页端实时日志里能一直看到进度在动
+            # 断点续传：axel 在目标旁留 .st 状态文件，中断后重跑同一命令即从断点继续。
+            local try
+            for try in 1 2 3 4 5; do
+              axel -n "$THREADS" -a -o "$ISO" "$URL" && break
+              echo "[$BR] 第 ${try} 次中断 $(date -u +%H:%M:%S)，5 秒后续传"
+              sleep 5
+            done
+            if [ ! -s "$ISO" ]; then
+              echo "ERROR: $BR 下载失败"
+              ls -l "$ISO"* 2>/dev/null || true
+              return 1
+            fi
 
-            GOT="$(find "$WORK" -maxdepth 1 -type f -size +100M -printf '%s\t%p\n' | sort -rn | head -1 | cut -f2-)"
-            [ -n "$GOT" ] || { echo "ERROR: $BR 未产出 ISO"; ls -la "$WORK"; return 1; }
-            mv -f -- "$GOT" "$ISO"
-
-            echo "[$BR] 下载完成 $(date -u +%H:%M:%S)  $(stat -c '%s' "$ISO") bytes，开始 SHA256 校验"
+            echo "[$BR] 下载完成 $(date -u +%H:%M:%S)，$(stat -c '%s' "$ISO") bytes，开始 SHA256 校验"
             echo "$SHA  $ISO" | sha256sum -c -
-            rm -f "$ISO".part*
+            rm -f "$ISO".part* "$ISO".st
             split -b "${CHUNK_MIB}M" -a 1 --numeric-suffixes=1 "$ISO" "$ISO.part"
             ls -l "$ISO".part*
             ensure_release
             gh release upload baseline --repo "$REPO" --clobber "$ISO".part*
-            rm -rf "$WORK" "$ISO" "$ISO".part*
+            rm -f "$ISO" "$ISO".part* "$ISO".st
             echo "[$BR] 完成 $(date -u +%H:%M:%S)"
           }
 
-          # 各源并行下载（互不相干；串行会把两个 ISO 塞进同一个 6h 预算里，必挂）
+          # 各源并行下载
           pids=()
-          while IFS=$'\t' read -r BR NAME MAG SHA; do
-            [ -z "$MAG" ] && continue
+          while IFS=$'\t' read -r BR URL SHA; do
+            [ -z "$URL" ] && continue
             BR="$(printf '%s' "$BR" | tr -d '"')"
-            NAME="$(printf '%s' "$NAME" | tr -d '"')"
-            MAG="$(printf '%s' "$MAG" | tr -d '"')"
+            URL="$(printf '%s' "$URL" | tr -d '"')"
             SHA="$(printf '%s' "$SHA" | tr -d '"' | tr 'a-f' 'A-F')"
-            [ -n "$NAME" ] || { echo "ERROR: 分支 $BR 缺 name 字段"; exit 1; }
-            fetch_one "$BR" "$NAME" "$MAG" "$SHA" &
+            ISO="$(basename "$URL")"
+            fetch_one "$BR" "$ISO" "$URL" "$SHA" &
             pids+=($!)
           done <<< "$ROWS"
 
@@ -136,11 +121,11 @@ jobs:
 
           # merge.cmd：期望哈希逐条内嵌（纯由 config.yml 派生，与下载结果无关）
           EXP_LINES=""
-          while IFS=$'\t' read -r BR NAME MAG SHA; do
-            [ -z "$MAG" ] && continue
-            NAME="$(printf '%s' "$NAME" | tr -d '"')"
+          while IFS=$'\t' read -r BR URL SHA; do
+            [ -z "$URL" ] && continue
+            ISO="$(printf '%s' "$URL" | tr -d '"' | sed 's#.*/##')"
             SHA="$(printf '%s' "$SHA" | tr -d '"' | tr 'a-f' 'A-F')"
-            EXP_LINES="${EXP_LINES}set \"EXP_${NAME}=${SHA}\""$'\n'
+            EXP_LINES="${EXP_LINES}set \"EXP_${ISO}=${SHA}\""$'\n'
           done <<< "$ROWS"
 
           mkdir -p dist
