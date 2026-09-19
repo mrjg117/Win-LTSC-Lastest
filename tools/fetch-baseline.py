@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-从权威分发拉取官方 LTSC ISO，逐字节校验 SHA256，7z 分包（<=1.9GiB）后
-上传到本仓库 baseline Release。
+从权威分发拉取官方 LTSC ISO，逐字节校验 SHA256，RAW 顺序切分（<=1.9GiB/片）
+后上传到本仓库 baseline Release。
 
 设计要点：
 - 期望 SHA256 的单一真相源 = 仓库 config.yml 的 baseline.sha256.<分支>。
   拉取后强制比对，不符即中止（满足"权威分发必须校验微软公开值"）。
-- 分卷命名 = 微软原版 ISO 名：<isoName>.7z.001 ...（build_iso.yml 按 *<isoName>.7z.* 匹配）。
+- 切分命名 = 微软原版 ISO 名：<isoName>.part1 / .part2 / ...（RAW 顺序字节，
+  merge.cmd 用 copy /b 拼回，零压缩、零依赖）。build_iso.yml 按 *<isoName>.part* 匹配。
+- 同时生成 merge.cmd（内嵌各 ISO 期望哈希），随 baseline 一起发布，下载方双击即可重组+校验。
 - 单一来源 URL 在 baseline-sources.json。
 - 磁盘约束：Actions runner 只有 ~14GB，两个 ISO 各 ~5GB，不能并发占盘。
-  因此改为【逐分支】：下载→校验→分包→上传→立即删盘，再处理下一分支。
+  因此改为【逐分支】：下载→校验→切分→上传→立即删盘，再处理下一分支。
 - 单分支失败不连累其它分支（记录失败，继续下一个；全部失败才退出非 0）。
 - manifest 跨次合并：先下载已有 baseline.manifest.json 保留其它分支，再写回。
 """
@@ -66,6 +68,47 @@ def sha256_file(p):
     return h.hexdigest()
 
 
+def raw_split(src_path, iso, chunk_mib=1900):
+    """顺序字节切分：<iso>.part1 / .part2 / ... 每块 <= chunk_mib MiB。
+    拼回即 copy /b part1+part2+... iso（与切分严格互为逆操作）。"""
+    chunk = chunk_mib * 1024 * 1024
+    vols = []
+    idx = 1
+    with open(src_path, "rb") as f:
+        while True:
+            part = "%s.part%d" % (iso, idx)
+            written = 0
+            with open(part, "wb") as out:
+                while written < chunk:
+                    buf = f.read(16 * 1024 * 1024)
+                    if not buf:
+                        break
+                    out.write(buf)
+                    written += len(buf)
+            if written == 0:
+                os.remove(part)
+                break
+            vols.append(part)
+            if written < chunk:
+                break
+            idx += 1
+    return vols
+
+
+def render_merge_cmd(manifest):
+    """用仓库 merge.cmd 模板，把 EXPECTED_HASHES 区块替换成各 ISO 的实际哈希。"""
+    tpl = open("merge.cmd", encoding="utf-8").read()
+    lines = "\n".join(
+        'set "EXP_%s=%s"' % (ed["isoName"], ed["isoSha256"].upper())
+        for ed in manifest["editions"].values()
+    )
+    return re.sub(
+        r"(REM ===EXPECTED_HASHES_START===).*?(REM ===EXPECTED_HASHES_END===)",
+        lambda m: "%s\n%s\n%s" % (m.group(1), lines, m.group(2)),
+        tpl, flags=re.S,
+    )
+
+
 def gh(*args):
     return subprocess.run(
         ["gh", *args, "--repo", REPO],
@@ -77,7 +120,7 @@ def gh(*args):
 def ensure_release():
     if gh("release", "view", "baseline").returncode != 0:
         gh("release", "create", "baseline", "--title", "baseline",
-           "--notes", "官方 LTSC ISO 分卷（权威分发拉取，SHA256 见 baseline.manifest.json / SHA256SUMS）")
+           "--notes", "官方 LTSC ISO 原版镜像（RAW 切分，SHA256 见 baseline.manifest.json / SHA256SUMS / merge.cmd）")
 
 
 def write_manifest_and_sums(manifest):
@@ -86,7 +129,7 @@ def write_manifest_and_sums(manifest):
     sums = []
     for _b, ed in manifest["editions"].items():
         for v, h in ed["volumeSha256"].items():
-            sums.append(f"{h}  {v}")
+            sums.append("%s  %s" % (h, v))
     open("SHA256SUMS", "w", encoding="utf-8").write("\n".join(sums) + "\n")
 
 
@@ -105,18 +148,18 @@ failed = []
 
 for b in branches:
     if (not FORCE) and b in manifest["editions"]:
-        print(f"{b} 已在 baseline 且非 force，跳过")
+        print("%s 已在 baseline 且非 force，跳过" % b)
         continue
 
     exp = expected_sha(b)
     if not exp:
-        print(f"ERROR: config.yml baseline.sha256.{b} 仍是占位符，请先填微软公开 SHA256")
+        print("ERROR: config.yml baseline.sha256.%s 仍是占位符，请先填微软公开 SHA256" % b)
         failed.append(b)
         continue
 
     info = src.get(b)
     if not info:
-        print(f"ERROR: baseline-sources.json 缺少 {b}")
+        print("ERROR: baseline-sources.json 缺少 %s" % b)
         failed.append(b)
         continue
 
@@ -138,19 +181,18 @@ for b in branches:
         except Exception as e:  # noqa: BLE001
             print("  失败:", e)
     if not ok:
-        print(f"ERROR: {b} 所有源下载失败")
+        print("ERROR: %s 所有源下载失败" % b)
         failed.append(b)
         continue
 
     act = sha256_file("dl_" + iso)
     if act.lower() != exp.lower():
-        print(f"ERROR: {b} SHA256 不符! 期望 {exp} 实际 {act}")
+        print("ERROR: %s SHA256 不符! 期望 %s 实际 %s" % (b, exp, act))
         failed.append(b)
         continue
-    print(f"{b} SHA256 校验通过: {act}")
+    print("%s SHA256 校验通过: %s" % (b, act))
 
-    subprocess.run(["7z", "a", "-v1900m", f"{iso}.7z", "dl_" + iso], check=True)
-    vols = sorted(glob.glob(f"{iso}.7z.*"))
+    vols = raw_split("dl_" + iso, iso)
     vsha = {v: sha256_file(v) for v in vols}
     manifest["editions"][b] = {
         "isoName": iso,
@@ -163,8 +205,11 @@ for b in branches:
     }
     write_manifest_and_sums(manifest)
 
+    # 生成带哈希的 merge.cmd（覆盖所有已上传分支）
+    open("merge.cmd.gen", "w", encoding="utf-8").write(render_merge_cmd(manifest))
+
     ensure_release()
-    files = vols + ["baseline.manifest.json", "SHA256SUMS"]
+    files = vols + ["baseline.manifest.json", "SHA256SUMS", "merge.cmd.gen"]
     r = gh("release", "upload", "baseline", "--clobber", *files)
     if r.returncode != 0:
         print("UPLOAD FAIL:", r.stderr)
@@ -173,7 +218,7 @@ for b in branches:
         write_manifest_and_sums(manifest)
         failed.append(b)
     else:
-        print(f"{b} 上传完成: {len(vols)} 块 -> baseline Release")
+        print("%s 上传完成: %d 块 -> baseline Release" % (b, len(vols)))
 
     # 立即删盘，释放空间给下一分支（runner 仅 ~14GB）
     try:
@@ -185,6 +230,10 @@ for b in branches:
             os.remove(v)
         except OSError:
             pass
+    try:
+        os.remove("merge.cmd.gen")
+    except OSError:
+        pass
 
 if not manifest["editions"]:
     print("ERROR: 没有任何分支成功")

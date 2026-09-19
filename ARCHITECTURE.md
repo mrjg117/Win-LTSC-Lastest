@@ -26,15 +26,17 @@ Win-LTSC-ISO/                         ← 你的公开仓库
 │   │   ├── 06.Patch-Components.ps1   # 精简组件：T1 Capability + T2 IoT Removable Packages
 │   │   ├── 07.Assert-UBR.ps1         # 改造D：断言 build主版本一致 ∧ UBR≥target ∧ 目标KB已装
 │   │   ├── 08.Bake-Image.ps1         # 离线烤入 WIM：C:\PostSetup + setupcomplete.cmd + Panther\unattend.xml（WinNTSetup 兼容）
+│   │   ├── 09.Gen-PostSetup.ps1      # 读 config.yml -> postsetup.settings.json（首启配置，被 08 烤入 C:\PostSetup）
 │   │   └── 99.Force-W10UI-Ini.ps1    # 强制两行：wim2esd=0 / ResetBase=0（不整文件覆盖）
 │   ├── assets/                       # 静态载荷（按分支可选，构建时拷进 ./src）
 │   │   ├── drivers/                  # 驱动池：递归塞全部，部署时 PnP 只装匹配硬件的
 │   │   │   └── boot/                 # 最小集：存储/RAID/NVMe/网卡 → 注入 boot.wim
 │   │   ├── redist/                   # VC++ 官方独立包（2005/2008/2010/2012/2013 + 2015-2022 合并）
 │   │   └── apps/                     # 预装 appx + license + 框架依赖（仅 Win11 分支）
-│   ├── postsetup/                    # 用户自定义脚本 → 落 C:\PostSetup（明显位置，可清）
-│   │   ├── 00-disable-hibernation.ps1
-│   │   ├── 01-wsreset.ps1            # 可选，仅 Store 坏了才用
+│   ├── postsetup/                    # 首启脚本 → 落 C:\PostSetup（明显位置，可清）
+│   │   ├── Run-All.ps1               # 调度器：顺序跑 .ps1/.cmd，按 .clean.flag 自清
+│   │   ├── Apply-Settings.ps1        # 按 postsetup.settings.json 应用 MAS/关休眠/关预留空间/虚拟内存/wsreset
+│   │   ├── postsetup.settings.json   # 构建期由 config.yml 生成（被 08 烤入映像）
 │   │   └── __README__.md             # 说明：往这目录丢 .ps1/.cmd 就自动被首启执行
 │   ├── config/
 │   │   ├── unattend-26100.xml        # 应答模板，构建期离线烤进 WIM 的 C:\Windows\Panther\unattend.xml
@@ -42,8 +44,9 @@ Win-LTSC-ISO/                         ← 你的公开仓库
 │   │   └── setupcomplete.cmd         # 首启引导，离线烤进 WIM 的 C:\Windows\Setup\Scripts\（调 Run-All.ps1）
 │   └── win10ui-override.ini          # 仅两行强制值，供 99.Force-W10UI-Ini.ps1 写回
 │
-├── patchlist.json                    # 每分支目标 UBR / LCU / 组件精简清单 / 驱动集
-├── config.yml                        # 全局开关：组件 / 三端上传 / 三端保留数 / 驱动集 / 基线源
+├── patchlist.json                    # 每分支目标 UBR / LCU / 组件精简清单 / 驱动集（构建引擎读它，按月更新）
+├── config.yml                        # 【唯一控制面板】组件/应用/驱动开关、postsetup(首启脚本)、存储、触发、baseline
+├── merge.cmd                         # 通用合并+校验：RAW 分块双击即重组 ISO 并核对 SHA256（随每个 Release 发布）
 ├── last-build.json                   # 构建成功写入（cron 兜底读它去重，避免重复构建）
 ├── tools/
 │   └── upload-baseline.ps1           # 本机一次性：ISO 分包(≤1.9GiB) → baseline Release + .sha256 清单
@@ -66,11 +69,13 @@ Win-LTSC-ISO/                         ← 你的公开仓库
         │                                  - 删除 update-meta4.yml（被改造A取代）
         │                                  + win10ui-override.ini 强制两行
         │
-从 own baseline Release 拉分块 → 7z/type 重组 → SHA256 校验 → 挂载 ./src/ISO/
+从 own baseline Release 拉分块 → RAW 顺序字节重组(copy /b) → SHA256 校验 → 挂载 ./src/ISO/
         │
 ./src/Patch.cmd ──▶ 7z解ISO → DISM读build/arch → A清单 → B下载 → W10UI集成 → E(VC/驱动/应用) → 06精简 → D断言 → oscdimg封装
         │
-成品 ISO ──▶ Release(分块) + R2(可选) + OneDrive(可选)   [KEEP_RELEASE / KEEP_R2 / KEEP_ONEDRIVE 各自独立]
+成品 ISO ──▶ RAW 切分(≤1.9GiB/片, .part1/2/3) + 生成带哈希的 merge.cmd ──▶ Release(分块+merge.cmd) + R2(可选) + OneDrive(可选)
+          Release 标签格式：YYMMDD-UBR-W10 / YYMMDD-UBR-W11；ISO 名：zh-cn_windows_XX_..._x64_YYMMDD_UBR.iso
+          baseline Release：两个原版 ISO 的 RAW 分块 + merge.cmd（源镜像与产出明显分开）   [KEEP_RELEASE / KEEP_R2 / KEEP_ONEDRIVE 各自独立]
 ```
 
 ---
@@ -106,7 +111,7 @@ Win-LTSC-ISO/                         ← 你的公开仓库
 **文件残留与清理（你问的关键点）—— 不是「一直留着」**：
 - `C:\Windows\Panther\unattend.xml`：**部署一次性**。Windows 首启在 specialize 阶段读取并消费它后，从 Win8 起 **Setup 会自动删除该文件**（安全默认，防明文密码/密钥残留）。即「烤进去 → 首启用一次 → 系统自动删」，不占硬盘。我们不 100% 依赖系统清理（精简镜像可能不触发该 pass），故 `setupcomplete.cmd` 末尾**显式兜底删** `Panther\unattend.xml` 与 `Panther\Unattend\`，确保干净。
 - `C:\Windows\Setup\Scripts\setupcomplete.cmd`：**Windows 不自动删**（它是自定义薄引导，系统不知何时该删）。故脚本末尾 `del /f /q %~f0` **自删**，不留痕。
-- `C:\PostSetup\*`：由 `config.yml` 的 `CLEAN_POSTSETUP` 开关决定——`true` 跑完自清（或你随时手动删），`false` 留着便于审计/二次执行。
+- `C:\PostSetup\*`：由 `config.yml` 的 `postsetup.clean_after_run` 决定——`true` 构建期烤入 `.clean.flag`，`Run-All.ps1` 首启跑完自清；`false` 留着审计/二次执行。首启的具体行为（MAS/关休眠/关预留空间/虚拟内存/wsreset）全部读 `postsetup.settings.json`，该文件由 `config.yml` 生成，改配置不必碰脚本。
 - **结论**：`unattend`=一次性（系统删+兜底删）；`setupcomplete`=薄引导（自删）；`PostSetup`=你的脚本（你决定留删）。三样均不建服务、不建计划任务、不侵入系统。
 5. **驱动**：构建期已用 `DISM /Add-Driver` 离线烤进 WIM（部署时 PnP 只装匹配硬件的）；WinNTSetup 的「Add Drivers」选项可作为补充，但非必需。
 

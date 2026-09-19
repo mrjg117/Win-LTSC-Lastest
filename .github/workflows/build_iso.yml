@@ -76,36 +76,54 @@ jobs:
           # 根级配置文件也要进 src：delta/lib/*.ps1 是按 $WorkDir(=src) 读取的
           cp -f self/patchlist.json src/patchlist.json || true
           cp -f self/config.yml src/config.yml || true
+          cp -f self/merge.cmd src/merge.cmd || true
           rm -f src/.github/workflows/update-meta4.yml || true
           echo "--- src 顶层文件 ---"
           ls -1 src/
 
       - name: cron 去重（仅每月兜底，本月已构建则跳过）
         if: github.event_name == 'schedule'
-        shell: bash
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          YM=$(date +%Y%m)
-          if gh release list --repo "${{ github.repository }}" --limit 200 2>/dev/null | grep -q "iso-${{ matrix.branch }}-$YM"; then
-            echo "SKIP=1" >> "$GITHUB_ENV"
-            echo "本月已有 iso-${{ matrix.branch }}-$YM 构建，跳过"
-          fi
+          $edition = @{ "19044" = "W10"; "26100" = "W11" }["${{ matrix.branch }}"]
+          $ym = Get-Date -Format yyMM
+          $raw = @(gh release list --repo "${{ github.repository }}" --limit 200 --json tagName --jq '.[].tagName')
+          foreach ($t in $raw) {
+            if ($t -match "^(\d{2})(\d{2})\d{2}-\d+-$edition$") {
+              $p = "$($matches[1])$($matches[2])"
+              if ($p -eq $ym) {
+                echo "SKIP=1" >> "$env:GITHUB_ENV"
+                echo "本月已有 $t 构建，跳过"
+                break
+              }
+            }
+          }
 
-      - name: 从 baseline Release 拉分块 -> 7z 重组 -> SHA256 校验
+      - name: 从 baseline Release 拉 RAW 分块 -> copy/b 重组 -> SHA256 校验
         if: env.SKIP != '1'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $branch = "${{ matrix.branch }}"
-          # baseline 7z 分卷以微软原版 ISO 名命名（见 fetch-baseline.py）；按分支映射到 iso 名
+          # baseline RAW 分卷以微软原版 ISO 名命名（见 fetch-baseline.py）；按分支映射到 iso 名
           $isoName = @{ "19044" = "zh-cn_windows_10_enterprise_ltsc_2021_x64_dvd_033b7312.iso"; "26100" = "zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso" }[$branch]
           New-Item -ItemType Directory -Force -Path chunks | Out-Null
-          gh release download baseline --repo "${{ github.repository }}" --dir chunks --pattern "*$isoName.7z.*"
-          $first = Get-ChildItem chunks -Filter "*$isoName.7z.001" | Select-Object -First 1
-          if (-not $first) { throw "未找到 baseline 分块（请先运行 fetch-baseline 上传官方 ISO 分卷）" }
-          & src/bin/7z.exe x $first.FullName -obaseline_out | Out-Null
-          $iso = Get-ChildItem baseline_out -Filter *.iso | Select-Object -First 1
-          if (-not $iso) { throw "7z 重组未产出 ISO" }
+          gh release download baseline --repo "${{ github.repository }}" --dir chunks --pattern "*$isoName.part*"
+          # 按 .part 后的数字排序，顺序字节拼回（与切分严格互逆，等同 copy /b）
+          $parts = @(Get-ChildItem chunks -Filter "$isoName.part*" | Sort-Object { [int]($_.Name -replace '.*\.part', '') })
+          if ($parts.Count -eq 0) { throw "未找到 baseline 分块（请先运行 fetch-baseline 上传官方 ISO RAW 分卷）" }
+          $fs = [System.IO.File]::Create("baseline_out.iso")
+          try {
+            foreach ($p in $parts) {
+              $in = [System.IO.File]::OpenRead($p.FullName)
+              try { $in.CopyTo($fs) } finally { $in.Close() }
+            }
+          } finally { $fs.Close() }
+          $iso = Get-Item "baseline_out.iso"
+          if (-not $iso) { throw "RAW 重组未产出 ISO" }
           Move-Item $iso.FullName "src\baseline-$branch.iso" -Force
           $actual = (Get-FileHash "src\baseline-$branch.iso" -Algorithm SHA256).Hash
           $yml = Get-Content self/config.yml -Raw
@@ -114,8 +132,8 @@ jobs:
           $expected = $m.Groups[1].Value
           if ($actual -ne $expected) { throw "baseline SHA256 不符! 期望 $expected 实际 $actual" }
           Write-Host "baseline SHA256 OK: $actual"
-          # 释放磁盘：分块与解压目录已无用（runner D: 仅约 14GB）
-          Remove-Item chunks, baseline_out -Recurse -Force -ErrorAction SilentlyContinue
+          # 释放磁盘：分块与重组目录已无用（runner D: 仅约 14GB）
+          Remove-Item chunks, baseline_out.iso -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: 运行 Patch.cmd（A→B→W10UI→E→D）
         if: env.SKIP != '1'
@@ -124,7 +142,7 @@ jobs:
           cd src
           Patch.cmd ${{ matrix.branch }}
 
-      - name: 读取 UBR -> TAG + 释放 DVD 目录 + 创建 Release（manifest/logs）
+      - name: 读取 UBR -> 计算 TAG / ISO_BASE / 生成 Release（manifest/logs）
         if: env.SKIP != '1'
         shell: pwsh
         env:
@@ -132,10 +150,16 @@ jobs:
         run: |
           $m = Get-Content src/manifest.json | ConvertFrom-Json
           $ubr = $m.targetUBR
-          $ym = Get-Date -Format yyyyMM
-          $tag = "iso-${{ matrix.branch }}-$ym-$ubr"
+          $date = Get-Date -Format yyMMdd
+          $edition = @{ "19044" = "W10"; "26100" = "W11" }["${{ matrix.branch }}"]
+          $tag = "$date-$ubr-$edition"
+          $isoBase = @{ "19044" = "zh-cn_windows_10_enterprise_ltsc_2021_x64_${date}_${ubr}"; "26100" = "zh-cn_windows_11_enterprise_ltsc_2024_x64_${date}_${ubr}" }["${{ matrix.branch }}"]
           echo "TAG=$tag" >> $env:GITHUB_ENV
-          Write-Host "TAG=$tag"
+          echo "ISO_BASE=$isoBase" >> $env:GITHUB_ENV
+          echo "DATE=$date" >> $env:GITHUB_ENV
+          echo "UBR=$ubr" >> $env:GITHUB_ENV
+          echo "EDITION=$edition" >> $env:GITHUB_ENV
+          Write-Host "TAG=$tag  ISO_BASE=$isoBase"
           # 释放磁盘：最终 ISO 已封装完，中间 DVD 目录(~5.3GB)不再需要。runner D: 仅约 14GB。
           Remove-Item src/ISO -Recurse -Force -ErrorAction SilentlyContinue
           if ($env:DO_RELEASE -eq 'true') {
@@ -150,14 +174,13 @@ jobs:
             gh release create "$tag" --repo "${{ github.repository }}" --title "$tag" --notes "branch=${{ matrix.branch }} | upstream_commit=$env:UPSTREAM_COMMIT | UBR=$ubr | 见 manifest.json" @logs src/manifest.json
           }
 
-      - name: 分片上传 ISO（≤1.9GiB/片，上岸即删）
+      - name: 重命名 + RAW 切分上传 ISO（≤1.9GiB/片，上岸即删）+ 生成 merge.cmd
         if: env.DO_RELEASE == 'true' && env.SKIP != '1'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 逐片生成 -> 上传 -> 立即删除，避免 ISO(7.9GB)+全部分片(~7.9GB) 同时占盘撑爆 runner
-          # [关键] Patch.cmd 在 src/ 下执行，产物落在 src/out/；本步工作目录是仓库根，必须带 src/ 前缀
+          # [关键] Patch.cmd 在 src/ 下执行，产物落在 src/out/WinLTSC-<branch>.iso；本步工作目录是仓库根，必须带 src/ 前缀
           $isoPath = "src/out/WinLTSC-${{ matrix.branch }}.iso"
           if (-not (Test-Path $isoPath)) {
             Write-Host "src 下的 out 目录内容："
@@ -165,17 +188,22 @@ jobs:
             Write-Host "src 下的子目录：$((Get-ChildItem src -Directory -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) -join ', ')"
             throw "最终 ISO 未生成：$isoPath"
           }
-          $iso = Get-Item $isoPath
+          $isoBase = $env:ISO_BASE
+          $finalIso = "src/out/$isoBase.iso"
+          Move-Item $isoPath $finalIso -Force
+          $iso = Get-Item $finalIso
           $size = $iso.Length
-          Write-Host "ISO size = $([math]::Round($size/1GB,2)) GB"
+          $hash = (Get-FileHash $finalIso -Algorithm SHA256).Hash
+          Write-Host "ISO size = $([math]::Round($size/1GB,2)) GB  SHA256=$hash"
+          # 逐片生成 -> 上传 -> 立即删除，避免 ISO(7.9GB)+全部分片(~7.9GB) 同时占盘撑爆 runner
           $chunk = 1900L * 1024L * 1024L
           $buf = New-Object byte[] (16777216)
           New-Item -ItemType Directory -Force -Path out | Out-Null
           $idx = 1
-          $fs = [System.IO.File]::OpenRead($iso.FullName)
+          $fs = [System.IO.File]::OpenRead($finalIso)
           try {
             while ($fs.Position -lt $size) {
-              $name = "out/WinLTSC-${{ matrix.branch }}.part{0:D3}" -f $idx
+              $name = "out/$isoBase.part$idx"
               $out = [System.IO.File]::Create($name)
               try {
                 $written = 0L
@@ -202,13 +230,20 @@ jobs:
           Write-Host "共上传 $count 片"
           $expected = [math]::Ceiling($size / $chunk)
           if ($count -ne $expected) { throw "片数校验失败：期望 $expected 片，实际 $count 片" }
+          # 生成 merge.cmd（内嵌本 ISO 期望哈希）并上传
+          $tpl = Get-Content self/merge.cmd -Raw
+          $expLine = 'set "EXP_' + $isoBase + '.iso=' + $hash.ToUpper() + '"'
+          $tpl = $tpl -replace '(?s)(REM ===EXPECTED_HASHES_START===).*?(REM ===EXPECTED_HASHES_END===)', ('$1' + [Environment]::NewLine + $expLine + [Environment]::NewLine + '$2')
+          Set-Content -Path "out/merge.cmd" -Value $tpl -NoNewline
+          gh release upload "$env:TAG" "out/merge.cmd" --repo "${{ github.repository }}" --clobber
+          Remove-Item "out/merge.cmd" -Force
           # 校验 Release 资产数与 part 数一致
           $assets = (gh api "repos/${{ github.repository }}/releases/tags/$env:TAG" | ConvertFrom-Json).assets | Where-Object { $_.name -like "*.part*" }
           Write-Host "Release 上的 part 资产数：$($assets.Count)"
           if ($assets.Count -lt $expected) { throw "Release 资产缺失：期望 $expected 个 part，实际 $($assets.Count) 个" }
           # R2 / OneDrive 通道若开启则需保留 ISO；否则删掉释放磁盘
           if ($env:DO_R2 -ne 'true' -and $env:DO_ONEDRIVE -ne 'true') {
-            Remove-Item $isoPath -Force
+            Remove-Item $finalIso -Force
             Write-Host "已删除本地 ISO，释放 $([math]::Round($size/1GB,2)) GB"
           }
 
@@ -233,7 +268,7 @@ jobs:
           RCLONE_CONFIG_R2_REGION: auto
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          rclone copy "src\out\WinLTSC-${{ matrix.branch }}.iso" "r2:$env:R2_BUCKET/iso-${{ matrix.branch }}-$env:TAG/"
+          rclone copy "src\out\$env:ISO_BASE.iso" "r2:$env:R2_BUCKET/$env:TAG/"
 
       - name: 上传 OneDrive
         if: env.DO_ONEDRIVE == 'true' && env.SKIP != '1'
@@ -244,7 +279,7 @@ jobs:
           $dir = "$env:USERPROFILE\.config\rclone"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           [IO.File]::WriteAllBytes("$dir\rclone.conf", [Convert]::FromBase64String($env:ONEDRIVE_RCLONE_CONF_B64))
-          rclone copy "src\out\WinLTSC-${{ matrix.branch }}.iso" "onedrive:WinLTSC/iso-${{ matrix.branch }}-$env:TAG/"
+          rclone copy "src\out\$env:ISO_BASE.iso" "onedrive:WinLTSC/$env:TAG/"
 
       - name: prune Release（保留 KEEP_RELEASE 个）
         if: env.DO_RELEASE == 'true'
@@ -254,11 +289,12 @@ jobs:
           KEEP: ${{ env.KEEP_RELEASE }}
         run: |
           $keep = [int]$env:KEEP
+          $edition = @{ "19044" = "W10"; "26100" = "W11" }["${{ matrix.branch }}"]
           # [关键] gh --jq 输出的是"未加引号的纯文本行"，不是 JSON，不能再 ConvertFrom-Json
           $raw = @(gh release list --repo "${{ github.repository }}" --limit 100 --json tagName --jq '.[].tagName')
           # 降序=最新在前，Skip $keep 才能删掉"最旧的"、保留"最新的"
-          $tags = @($raw | Where-Object { $_ -match '^iso-${{ matrix.branch }}-' } | Sort-Object -Descending)
-          Write-Host "现有 iso-${{ matrix.branch }}-* 标签：$($tags.Count) 个 -> $($tags -join ', ')"
+          $tags = @($raw | Where-Object { $_ -like "*-$edition" } | Sort-Object -Descending)
+          Write-Host "现有 *-$edition 标签：$($tags.Count) 个 -> $($tags -join ', ')"
           $old = @($tags | Select-Object -Skip $keep)
           foreach ($t in $old) {
             gh release delete $t --repo "${{ github.repository }}" --yes
@@ -280,7 +316,8 @@ jobs:
           KEEP: ${{ env.KEEP_R2 }}
         run: |
           $keep = [int]$env:KEEP
-          $dirs = @(rclone lsd "r2:$env:R2_BUCKET" | ForEach-Object { ($_ -split '\s+')[-1] } | Where-Object { $_ -like "iso-${{ matrix.branch }}-*" } | Sort-Object -Descending)
+          $edition = @{ "19044" = "W10"; "26100" = "W11" }["${{ matrix.branch }}"]
+          $dirs = @(rclone lsd "r2:$env:R2_BUCKET" | ForEach-Object { ($_ -split '\s+')[-1] } | Where-Object { $_ -like "*-$edition" } | Sort-Object -Descending)
           $old = @($dirs | Select-Object -Skip $keep)
           foreach ($d in $old) { rclone purge "r2:$env:R2_BUCKET/$d"; Write-Host "pruned r2 $d" }
 
@@ -294,6 +331,7 @@ jobs:
           $dir = "$env:USERPROFILE\.config\rclone"
           [IO.File]::WriteAllBytes("$dir\rclone.conf", [Convert]::FromBase64String($env:ONEDRIVE_RCLONE_CONF_B64))
           $keep = [int]$env:KEEP
-          $dirs = @(rclone lsd "onedrive:WinLTSC" | ForEach-Object { ($_ -split '\s+')[-1] } | Where-Object { $_ -like "iso-${{ matrix.branch }}-*" } | Sort-Object -Descending)
+          $edition = @{ "19044" = "W10"; "26100" = "W11" }["${{ matrix.branch }}"]
+          $dirs = @(rclone lsd "onedrive:WinLTSC" | ForEach-Object { ($_ -split '\s+')[-1] } | Where-Object { $_ -like "*-$edition" } | Sort-Object -Descending)
           $old = @($dirs | Select-Object -Skip $keep)
           foreach ($d in $old) { rclone purge "onedrive:WinLTSC/$d"; Write-Host "pruned onedrive $d" }

@@ -114,6 +114,11 @@ echo [%date% %time%] [07] Assert-UBR >> "%LOG%"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\07.Assert-UBR.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
+REM ---- 09 生成 postsetup.settings.json（读 config.yml；08 会把它烤入 C:\PostSetup） ----
+echo [%date% %time%] [09] Gen-PostSetup >> "%LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\09.Gen-PostSetup.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+if errorlevel 1 goto :fail
+
 REM ---- 08 烤入自动应答 + PostSetup ----
 echo [%date% %time%] [08] Bake-Image >> "%LOG%"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\08.Bake-Image.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1

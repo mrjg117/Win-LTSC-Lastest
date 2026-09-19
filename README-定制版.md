@@ -14,7 +14,8 @@
 ## 一、需要你填的占位（首次必做）
 
 1. **`config.yml` → `baseline.sha256`**：填两个官方 ISO 的真实 SHA256（从微软公开值或你下载源公示值核对）。
-2. **`patchlist.json` → 每分支 `targetUBR` / `lcu`(kb,url,sha1) / `ssu`**：每月 Patch Tuesday 后更新 `targetUBR` 与补丁直链+SHA1（check-updates 会自动 bump `targetUBR`，但 `lcu.url/sha1` 建议人工确认）。
+2. **`config.yml` → `postsetup`**：首启脚本开关在此调（MAS / 关休眠 / 关预留空间 / 虚拟内存 / wsreset / 跑完自清），**改这些不必碰脚本**；`components`/`apps`/`drivers`/`storage`/`trigger` 也都在这里。
+3. **`patchlist.json` → 每分支 `targetUBR` / `lcu`(kb,url,sha1) / `ssu`**：每月 Patch Tuesday 后更新 `targetUBR` 与补丁直链+SHA1（check-updates 会自动 bump `targetUBR`，但 `lcu.url/sha1` 建议人工确认）。
 3. **Secrets**（仓库 Settings → Secrets，绝不进仓库文件）：
    - 三端上传按需：`R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_BUCKET`、`ONEDRIVE_RCLONE_CONF`（base64 编码的 rclone.conf）
    - `GITHUB_TOKEN` 由 Actions 自动提供，无需配置。
@@ -32,7 +33,9 @@ ISO 字节在你的机器上，本机跑一次（agent 沙箱无法代传）：
 ```
 
 脚本会展示 SHA256，请你核对微软/来源公示值，再把该值填进 `config.yml` 的 `baseline.sha256`。
-ISO 被 7z 分卷（≤1.9GiB）上传到仓库 `baseline` Release；工作流每次拉分块重组 + 校验。
+ISO 被 RAW 顺序切分（≤1.9GiB/片，无压缩）上传到仓库 `baseline` Release；工作流每次拉分块 `copy /b` 重组 + 校验。
+
+> 现在 CI 用 `Fetch Baseline ISO` 工作流（`tools/fetch-baseline.py`）直接从权威分发拉取并 RAW 切分上传，本机 `upload-baseline.ps1` 仅作备用。
 
 ---
 
@@ -48,14 +51,15 @@ ISO 被 7z 分卷（≤1.9GiB）上传到仓库 `baseline` Release；工作流�
 
 ## 四、三端存储与保留数
 
-- **Release**：单文件硬限 2 GiB → 成品 ISO 自动切成 `WinLTSC-<分支>.part001…`（每片 ≤1.9GiB，逐片上传后即刻删除以控磁盘）；资产免费、无过期、无带宽费。
-  取用：把全部 `.partNNN` 下到同一目录后执行
+- **Release**：单文件硬限 2 GiB → 成品 ISO 自动 RAW 切分（每片 ≤1.9GiB，逐片上传后即刻删除以控磁盘）；每个 Release 附带 `merge.cmd`，内嵌本 ISO 期望哈希。
+  取用：把 `merge.cmd` 和全部 `.partN` 下到同一目录，双击 `merge.cmd` 即自动重组 ISO 并核对 SHA256：
   ```bat
-  copy /b WinLTSC-26100.part* WinLTSC-26100.iso
+  merge.cmd
   ```
-  （baseline 原始 ISO 仍是传统 7z 分卷 `baseline-<分支>.7z.001…`，用 `7z x baseline-<分支>.7z.001` 解。）
+  （baseline 原版 ISO 同样 RAW 切分：`zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso.part1/2/3…`，配同一份 `merge.cmd`。）
 - **R2 / OneDrive**：整文件直传；保留数 `KEEP_R2` / `KEEP_ONEDRIVE` 独立（R2 免费额度小，默认关，开时调 1~2）。
 - 三端各自 `prune` 到保留数，旧的自动删。
+- **产出命名**：Release 标签 `YYMMDD-UBR-W10` / `YYMMDD-UBR-W11`；ISO 名 `zh-cn_windows_11_enterprise_ltsc_2024_x64_YYMMDD_UBR.iso`（含日期+UBR）。baseline 用微软原版名，源镜像与产出明显分开。
 
 ---
 

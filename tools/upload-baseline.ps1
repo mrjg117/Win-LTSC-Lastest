@@ -1,8 +1,10 @@
 ﻿<#
-.SYNOPSIS 一次性上传官方 LTSC ISO 分卷到本仓库 baseline Release
+.SYNOPSIS 一次性上传官方 LTSC ISO 分卷到本仓库 baseline Release（RAW 切分，无压缩）
 .DESCRIPTION 本机运行一次（ISO 字节在你机器上，agent 沙箱无法代传）。
              计算并展示 SHA256（你核对微软/来源公示值后填入 config.yml），
-             7z 分卷（≤1.9GiB 规避 Release 2GiB 单文件硬限），上传到 baseline Release。
+             RAW 顺序切分（≤1.9GiB/片，无压缩）为 <原版ISO名>.part1/2/3…，
+             并生成带哈希的 merge.cmd，一并上传到 baseline Release。
+             命名契约：<微软原版ISO名>.part*（build_iso.yml 按 *<isoName>.part* 匹配）。
              认证：本机已 `gh auth login` 自动用会话；或设 $env:GITHUB_TOKEN（仅 repo 权限 PAT）。
 #>
 [CmdletBinding()]
@@ -15,6 +17,9 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+$isoName = @{ "19044" = "zh-cn_windows_10_enterprise_ltsc_2021_x64_dvd_033b7312.iso";
+              "26100" = "zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso" }[$Branch]
+if (-not $isoName) { throw "未知分支: $Branch（仅 19044 / 26100）" }
 if (-not (Test-Path $IsoPath)) { throw "ISO 不存在: $IsoPath" }
 
 # 推断 Repo
@@ -34,18 +39,46 @@ Write-Host "ISO SHA256: $hash"
 Write-Host ">>> 请核对微软公开值 / 你下载源公示值，一致后再把此值填入 config.yml 的 baseline.sha256.$Branch"
 Write-Host "=" * 60
 
-# 2) 7z 分卷（卷名必须含分支号，build_iso.yml 按 *$branch.7z.* 匹配；否则拉基线时找不到）
-$base = "baseline-$Branch"
-$vol = "$base.7z"
-& 7z a -v${ChunkMiB}m $vol $IsoPath
-if ($LASTEXITCODE -ne 0) { throw "7z 分卷失败（本机需安装 7-Zip 且在 PATH）" }
+# 2) RAW 顺序切分（与 CI fetch-baseline.py 同契约：<isoName>.part1/2/3…）
+$chunk = [long]$ChunkMiB * 1024L * 1024L
+$vols = @()
+$idx = 1
+$fs = [System.IO.File]::OpenRead($IsoPath)
+try {
+    while ($fs.Position -lt $fs.Length) {
+        $part = "$isoName.part$idx"
+        $out = [System.IO.File]::Create($part)
+        try {
+            $written = 0L
+            while ($written -lt $chunk -and $fs.Position -lt $fs.Length) {
+                $buf = New-Object byte[] (16 * 1024 * 1024)
+                $n = $fs.Read($buf, 0, [int][Math]::Min([long]$buf.Length, $chunk - $written))
+                if ($n -le 0) { break }
+                $out.Write($buf, 0, $n)
+                $written += $n
+            }
+        } finally { $out.Close() }
+        $vols += $part
+        if ($written -lt $chunk) { break }
+        $idx++
+    }
+} finally { $fs.Close() }
+Write-Host "已切分 $($vols.Count) 片（≤${ChunkMiB}MiB/片）"
 
-# 3) 上传 baseline Release
-$assets = Get-ChildItem "$base.7z.*" | ForEach-Object { $_.FullName }
+# 3) 生成带哈希的 merge.cmd（用仓库模板）
+if (Test-Path "merge.cmd") {
+    $tpl = Get-Content "merge.cmd" -Raw
+    $expLine = 'set "EXP_' + $isoName + '=' + $hash.ToUpper() + '"'
+    $tpl = $tpl -replace '(?s)(REM ===EXPECTED_HASHES_START===).*?(REM ===EXPECTED_HASHES_END===)', ('$1' + [Environment]::NewLine + $expLine + [Environment]::NewLine + '$2')
+    Set-Content -Path "merge.cmd.gen" -Value $tpl -NoNewline
+    $vols += "merge.cmd.gen"
+}
+
+# 4) 上传 baseline Release
 if (-not (gh release view baseline --repo $Repo 2>$null)) {
     gh release create baseline --repo $Repo --title "baseline" `
-        --notes "官方 LTSC ISO 分卷（baseline），SHA256 见 config.yml" @assets
+        --notes "官方 LTSC ISO 原版镜像（RAW 切分，SHA256 见 config.yml / merge.cmd）" @vols
 } else {
-    gh release upload baseline --repo $Repo @assets
+    gh release upload baseline --repo $Repo --clobber @vols
 }
 Write-Host "已上传 $Branch 分卷到 $Repo 的 baseline Release"

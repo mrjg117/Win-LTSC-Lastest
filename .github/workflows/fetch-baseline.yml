@@ -2,8 +2,9 @@ name: Fetch Baseline ISO (authoritative mirror)
 
 # 手动触发：从权威分发（archive.org / itellyou）拉取官方 LTSC ISO，
 # 校验 SHA256（单一真相源 = config.yml 的 baseline.sha256.<分支>），
-# 7z 分包（<=1.9GiB）后上传到本仓库 baseline Release。
-# 命名契约：<微软原版ISO名>.7z.001 ...（build_iso.yml 按 *<isoName>.7z.* 匹配）。
+# RAW 顺序切分（<=1.9GiB/片，无压缩）后上传到本仓库 baseline Release。
+# 命名契约：<微软原版ISO名>.part1 / .part2 / ...（build_iso.yml 按 *<isoName>.part* 匹配）。
+# 同时发布 merge.cmd（内嵌各 ISO 期望哈希），下载方双击即可重组 + 校验。
 
 on:
   workflow_dispatch:
@@ -34,15 +35,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 600
     steps:
-      - name: Checkout（读取 config.yml + baseline-sources.json）
+      - name: Checkout（读取 config.yml + baseline-sources.json + merge.cmd 模板）
         uses: actions/checkout@v4
 
-      - name: 安装 7-Zip
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y p7zip-full
-
-      - name: 拉取 / 校验 / 分包 / 上传 baseline
+      - name: 拉取 / 校验 / RAW 切分 / 上传 baseline（含 merge.cmd）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH_SEL: ${{ inputs.branch }}

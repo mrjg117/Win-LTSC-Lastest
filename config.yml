@@ -1,82 +1,86 @@
-﻿# ============================================================================
-# Win-LTSC-ISO 全局配置（占位模板，按需修改）
-# 约定：所有带 <...> 的项需你填入真实值；密钥/Bucket/Token 一律走
-#       GitHub Actions Secrets 或本机环境变量，绝不写入本文件。
-# ============================================================================
+﻿# =============================================================================
+# Win-LTSC 统一配置 —— 唯一控制面板
+# 规则：全局开关/列表都写在这一个文件里；脚本只读它，别去改脚本。
+#       只有"真实二进制素材"(驱动.inf、MAS脚本、应答模板)才放文件夹。
+# 说明：
+#   - 本文件控制：上游、baseline、全局组件/应用/驱动开关、postsetup(首启脚本)、
+#     三端存储、触发策略。
+#   - 每分支的"构建目标"(targetUBR / LCU / SSU / 组件精简清单)在 patchlist.json，
+#     由构建引擎读取（差异化、按月更新），不要搬到这里以免两份真相源。
+# =============================================================================
 
 upstream:
-  repo: "adavak/Win_ISO_Patching_Scripts"
-  ref: "master"            # 滚动上游最新（非钉 tag）；要稳定可改某 tag 如 v2026.9b_2
+  repo: adavak/Win_ISO_Patching_Scripts
+  ref: master
 
 baseline:
-  release_tag: "baseline"  # 本仓库自有 baseline Release（存放两个官方 LTSC ISO 的分块）
-  # 每个分支的官方 ISO SHA256，必须填真实值；工作流拉取分块重组后强制比对，不符即中止
-  # 取值来源：微软公开值 / 你下载源（itellyou/Archive）公示值
+  chunk_mib: 1900                     # 每片上限(MiB)，留余量避开 GitHub 2GB 资产上限
   sha256:
     "19044": "C117C5DDBC51F315C739F9321D4907FA50090BA7B48E7E9A2D173D49EF2F73A3"
     "26100": "2CB21649590C8CF770CD93556596DFF4FD800F24D267A9BE9D9CE0EE9E03F5AC"
-  chunk_size_mib: 1900     # 每块 ≤1.9GiB（GitHub Release 单文件硬限 2GiB）
 
-branches:
-  - id: "19044"            # Windows 10 Enterprise LTSC 2021 (21H2)
-    label: "Win10-LTSC-2021"
-  - id: "26100"            # Windows 11 IoT Enterprise LTSC 2024
-    label: "Win11-LTSC-2024"
-
-# ---- 组件集成开关（每个独立可关） ----
-components:
-  vc_redist: true          # VC++ 2005~2022 官方逐项离线注入
-  dotnet_runtime: false    # .NET 8 Desktop Runtime（LTS）单版
-  webview2: false          # WebView2 evergreen 单版
-  directx: false           # DirectX Jun 2010（可选）
-  powershell7: false       # 额外添加 pwsh 7.x x64 单版（不升级/不堆叠内置 5.1）
-
-# ---- 应用预装（仅 Win11 分支生效；Win10 用内置经典版，不灌 Win11 包） ----
-apps:
-  enabled: true
-  store: true              # 先 provision Store 本体（LTSC 默认无）
-  paint: true
-  notepad: true
-  mediaplayer: true
-  nanazip: false
-
-# ---- 精简组件（lean profile，默认保守） ----
-# 默认 KEEP/REMOVE 倾向；具体覆盖在 patchlist.json 每分支的 lean 清单
+# ---- 组件精简：倾向开关（具体包名清单在 patchlist.json 每分支的 lean） ----
 lean:
   enabled: true
   remove_xps: true
   remove_wmp_legacy: true
-  keep_internet_printing: true   # 你说留着
-  keep_workfolders: true         # 你说留着
-  remove_ie11_win10: false       # Win10 因 Edge IE 模式依赖 MSHTML，KEEP
-  keep_rds_collaboration: true   # IoT 可移除包，为安全 KEEP（远程桌面家族）
-  iot_deep_cleanup: true         # IoT Removable Packages 深度精简（仅 IoT SKU）
+  keep_internet_printing: true       # 你说留着
+  keep_workfolders: true             # 你说留着
+  remove_ie11_win10: false           # Win10 因 Edge IE 模式依赖 MSHTML，KEEP
+  keep_rds_collaboration: true       # IoT 可移除包，为安全 KEEP（远程桌面家族）
+  iot_deep_cleanup: true             # IoT Removable Packages 深度精简（仅 IoT SKU）
 
-# ---- 驱动 ----
+# ---- 组件集成：写啥自动下载+集成，不限于 VC；列表项=已知别名或显式 url ----
+components:
+  redist:                             # Visual C++ 可再发行版(自动下载微软官方包)
+    - vc14_x64
+    - vc14_x86
+  dotnet_runtime: false              # true 时填版本号，脚本去官方拉
+  webview2: false
+  directx: false
+  powershell7: false
+
+# ---- 应用预装：写任意 Microsoft Store 包族名(PackageFamilyName)即集成 ----
+apps:
+  store: true                        # 恢复 Microsoft Store
+  paint: true                        # 画图
+  notepad: true                      # 新记事本
+  mediaplayer: true                  # 媒体播放器
+  nanazip: false
+  # 自定义：直接写包族名即可，例如：
+  # - Microsoft.WindowsTerminal_8wekyb3d8bbwe
+  # - Microsoft.PowerToys_8wekyb3d8bbwe
+
+# ---- 驱动注入：开关 + 真实文件放 assets/drivers/ ----
 drivers:
-  pool: true               # 全量驱动池注入 install.wim（留盘，PnP 仅装匹配硬件）
-  boot_minimal: true       # 存储/RAID/NVMe/网卡最小集注入 boot.wim（安装器见盘）
+  inject: true                       # assets/drivers/*.inf -> install.wim(全量池)
+  boot_minimal: true                 # assets/drivers/boot/*.inf -> boot.wim(最小集)
 
-# ---- 三端存储（各自独立开关 + 独立保留数） ----
+# ---- 首启脚本：每个都是 on/off 开关，调它别改脚本 ----
+postsetup:
+  mas: false                         # true=烤入并运行 MAS 激活(脚本放 delta/postsetup/mas/)
+  disable_hibernate: true            # true=关闭休眠(powercfg -h off)
+  disable_reserved_storage: false    # true=关闭预留空间(dism /Set-ReservedStorageState /Disabled)
+  pagefile:
+    mode: none                       # none(系统默认) | system_managed | fixed
+    fixed_mb: 4096                   # mode=fixed 时生效
+  wsreset: false                     # true=首启跑 wsreset -i 重注册 Store(需在线+网络)
+  clean_after_run: false             # true=Run-All.ps1 跑完自清 C:\PostSetup
+
+# ---- 产物上传 + 保留策略 ----
 storage:
   release:
-    upload: true
-    keep: 3                # KEEP_RELEASE：每分支各保留 3 个
+    enabled: true
+    keep: 3                          # 保留最近 3 个同分支/同系统 Release
   r2:
-    upload: false          # 默认关（免费额度小，主要给他人引用分发）；开时调 keep=1~2
-    keep: 1                # KEEP_R2
-    # 密钥走 secret：R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_BUCKET
+    enabled: false
+    keep: 1
+    bucket: ""                       # 填 R2 桶名(凭证走 Secrets)
   onedrive:
-    upload: false
-    keep: 2                # KEEP_ONEDRIVE
-    # 密钥走 secret：ONEDRIVE_RCLONE_CONF（rclone 配置 base64）或 GRAPH_TENANT/CLIENT/SECRET
+    enabled: false
+    keep: 2
 
-# ---- 触发相关 ----
+# ---- 自动检测更新 ----
 trigger:
-  only_important: false    # true=仅 Critical/Important 才构建；false=任何新累积即构建
-  monthly_fallback_weekday: 3   # 每月第 3 周三兜底（运行前查本月是否已构建）
-  monthly_fallback_hour_utc: 2
-
-# ---- 首启脚本清理 ----
-postsetup:
-  clean_after_run: false   # true=Run-All.ps1 跑完自清 C:\PostSetup；false=留着审计/二次执行
+  schedule: "0 6 * * *"              # 每日 06:00 UTC
+  only_important: false              # true=仅重要(质量/月度)更新才触发构建
