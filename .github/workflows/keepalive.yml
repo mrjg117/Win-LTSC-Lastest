@@ -1,0 +1,46 @@
+name: Keepalive
+
+# 为什么存在：公库连续 60 天没有「提交活动」时，GitHub 会自动停用该仓库的定时工作流
+#   （官方原文：In a public repository, scheduled workflows are automatically disabled
+#              when no repository activity has occurred in 60 days.）
+#
+# 为什么本文件在 main：schedule 只认默认分支
+#   （官方原文：This event will only trigger a workflow run if the workflow file exists on
+#              the default branch. / Scheduled workflows will only run on the default branch.）
+#   —— 「定时器本体」只能在默认分支；而心跳提交只落到 keepalive 分支，
+#      main 的提交历史与文件内容不受任何影响。
+#
+# 心跳方式：checkout keepalive -> 空提交 -> 推回 keepalive。
+
+on:
+  schedule:
+    # 每周一 03:17 UTC。远小于 60 天窗口；避开整点，减少排队延迟。
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout keepalive 分支
+        uses: actions/checkout@v4
+        with:
+          ref: keepalive
+          fetch-depth: 0
+
+      - name: 空提交并推回 keepalive
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore(keepalive): 心跳 $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push origin HEAD:keepalive
