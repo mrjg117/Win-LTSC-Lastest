@@ -22,20 +22,19 @@
 
 ---
 
-## 二、首次：上传官方基线 ISO
+## 二、首次：拉取官方基线 ISO
 
-ISO 字节在你的机器上，本机跑一次（agent 沙箱无法代传）：
+无需本机传封。到仓库 Actions 手动跑一次 **`Fetch Baseline ISO`** 工作流即可 —— 全部逻辑都在**工作流内**（纯 bash，无外部脚本），四步：
 
-```powershell
-# 本机已 gh auth login 后：
-.\tools\upload-baseline.ps1 -IsoPath "D:\iso\Win11_LTSC_2024.iso" -Branch 26100
-.\tools\upload-baseline.ps1 -IsoPath "D:\iso\Win10_LTSC_2021.iso" -Branch 19044
-```
+1. 从唯一权威源 `download.testip.xyz` 下载两个官方 LTSC ISO；
+2. 按 `config.yml` 的 `baseline.sha256` 校验 SHA256，不符即中止；
+3. RAW 顺序字节切分（`baseline.chunk_mib`，默认 1900 MiB/片，无压缩）→ `<微软原版ISO名>.part1/2/3…`；
+4. 生成内嵌两 ISO 哈希的 `merge.cmd`，连同分块上传到 `baseline` Release，并清理该 Release 上的一切其它残留资产。
 
-脚本会展示 SHA256，请你核对微软/来源公示值，再把该值填进 `config.yml` 的 `baseline.sha256`。
-ISO 被 RAW 顺序切分（≤1.9GiB/片，无压缩）上传到仓库 `baseline` Release；工作流每次拉分块 `copy /b` 重组 + 校验。
+产物固定只有两样：`<微软原版ISO名>.partN` 与 `merge.cmd`。
+取用：把 `merge.cmd` 和全部 `.partN` 下到同一目录，双击 `merge.cmd` 即自动 `copy /b` 重组 ISO 并核对 SHA256。
 
-> 现在 CI 用 `Fetch Baseline ISO` 工作流（`tools/fetch-baseline.py`）直接从权威分发拉取并 RAW 切分上传，本机 `upload-baseline.ps1` 仅作备用。
+> 期望哈希与分片大小的单一真相源 = `config.yml` 的 `baseline` 段；两个 ISO 的直链就写在工作流里（两行）。
 
 ---
 
@@ -96,5 +95,6 @@ delta/postsetup/                     首启自定义脚本（落 C:\PostSetup）
 delta/config/{unattend-*.xml,setupcomplete.cmd}
 .github/workflows/build_iso.yml      主构建
 .github/workflows/check-updates.yml  每日检测
-tools/upload-baseline.ps1            本机上传基线 ISO
+.github/workflows/fetch-baseline.yml 首次拉取官方基线（下载/校验/RAW切分/merge.cmd）
+tools/local-test.ps1                 本机管理员冒烟测试（不参与 CI）
 ```

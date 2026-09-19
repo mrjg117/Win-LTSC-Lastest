@@ -49,7 +49,7 @@ Win-LTSC-ISO/                         ← 你的公开仓库
 ├── merge.cmd                         # 通用合并+校验：RAW 分块双击即重组 ISO 并核对 SHA256（随每个 Release 发布）
 ├── last-build.json                   # 构建成功写入（cron 兜底读它去重，避免重复构建）
 ├── tools/
-│   └── upload-baseline.ps1           # 本机一次性：ISO 分包(≤1.9GiB) → baseline Release + .sha256 清单
+│   └── local-test.ps1                # 本机管理员冒烟测试（验证 delta/lib 的 DISM 逻辑，不参与 CI）
 └── README-定制版.md
 ```
 
@@ -76,6 +76,9 @@ Win-LTSC-ISO/                         ← 你的公开仓库
 成品 ISO ──▶ RAW 切分(≤1.9GiB/片, .part1/2/3) + 生成带哈希的 merge.cmd ──▶ Release(分块+merge.cmd) + R2(可选) + OneDrive(可选)
           Release 标签格式：YYMMDD-UBR-W10 / YYMMDD-UBR-W11；ISO 名：zh-cn_windows_XX_..._x64_YYMMDD_UBR.iso
           baseline Release：两个原版 ISO 的 RAW 分块 + merge.cmd（源镜像与产出明显分开）   [KEEP_RELEASE / KEEP_R2 / KEEP_ONEDRIVE 各自独立]
+          baseline 由 .github/workflows/fetch-baseline.yml 填充（纯 bash，无外部脚本）：
+            唯一权威源下载 → config.yml 的 SHA256 校验 → RAW 切分 → 生成内嵌哈希的 merge.cmd → 上传
+            并自动清理该 Release 上的任何非预期资产（只留 <原版ISO名>.partN + merge.cmd）
 ```
 
 ---
