@@ -1,6 +1,6 @@
 name: Fetch Baseline ISO (authoritative mirror)
 
-# 手动触发：按 config.yml 的 baseline.sources 逐条用 axel 多线程 HTTP 下载官方原版 ISO
+# 手动触发：按 config.yml 的 baseline.sources 逐条用 aria2 多线程 HTTP 下载官方原版 ISO
 #   -> SHA256 强校验 -> RAW 顺序切分（每片 <= baseline.chunk_mib，无压缩）
 #   -> 生成内嵌哈希的 merge.cmd -> 上传本仓库 baseline Release。
 #
@@ -27,8 +27,8 @@ jobs:
       - name: Checkout（config.yml + merge.cmd 模板）
         uses: actions/checkout@v4
 
-      - name: 安装 axel
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends axel
+      - name: 安装 aria2
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends aria2
 
       - name: 多线程下载 / 校验 / RAW 切分 / 上传 baseline
         shell: bash
@@ -75,14 +75,24 @@ jobs:
             echo "=============================================================="
             echo "[$BR] 下载 -> $ISO   开始 $(date -u +%H:%M:%S)"
 
-            # axel —— 轻量多线程 HTTP 下载器（apt 官方包，秒装，无编译）：
-            #   -n N  并发连接数（源站实测 Accept-Ranges: bytes，支持多连接分段）
-            #   -o F  直接落成契约文件名，省去事后改名
-            #   -a    简洁进度条，每秒刷新 —— 网页端实时日志里能一直看到进度在动
-            # 断点续传：axel 在目标旁留 .st 状态文件，中断后重跑同一命令即从断点继续。
+            # aria2 —— 轻量多线程 HTTP 下载器（apt 官方包，秒装，无编译）：
+            #   -x N -s N  单服务器连接数 / 分片数（源站实测 Accept-Ranges: bytes，支持分段）
+            #   -k1M       分片粒度 1 MiB
+            #   -d . -o F  直接落成契约文件名，省去事后改名
+            #   --file-allocation=none  不预分配，写大文件不白等
+            #   --summary-interval=0    关掉周期性汇总块，只留每秒一行的读秒
+            #   --auto-file-renaming=false --allow-overwrite=true  重跑时覆盖同名文件而非改名
+            # 进度在网页端为何是「一行一行往下滚」而不是刷屏：
+            #   aria2 按 stdout 是否终端（isatty）分两种输出。CI 里被管道接管 = 非终端，
+            #   它每秒输出一行纯文本（[#5c324e 240MiB/4.9GiB(4%) CN:16 DL:17MiB ETA:4m40s]）
+            #   并补一个换行；终端下那套 \r 原地覆盖的动画不会启用，故不会出现满屏空白。
+            # 断点续传：aria2 在目标旁留 .aria2 控制文件，中断后重跑同一命令即从断点继续。
             local try
             for try in 1 2 3 4 5; do
-              axel -n "$THREADS" -a -o "$ISO" "$URL" && break
+              aria2c -x"$THREADS" -s"$THREADS" -k1M \
+                     --file-allocation=none --summary-interval=0 \
+                     --auto-file-renaming=false --allow-overwrite=true \
+                     -d . -o "$ISO" "$URL" 2>&1 | sed "s/^/[$BR] /" && break
               echo "[$BR] 第 ${try} 次中断 $(date -u +%H:%M:%S)，5 秒后续传"
               sleep 5
             done
@@ -94,12 +104,12 @@ jobs:
 
             echo "[$BR] 下载完成 $(date -u +%H:%M:%S)，$(stat -c '%s' "$ISO") bytes，开始 SHA256 校验"
             echo "$SHA  $ISO" | sha256sum -c -
-            rm -f "$ISO".part* "$ISO".st
+            rm -f "$ISO".part* "$ISO".aria2
             split -b "${CHUNK_MIB}M" -a 1 --numeric-suffixes=1 "$ISO" "$ISO.part"
             ls -l "$ISO".part*
             ensure_release
             gh release upload baseline --repo "$REPO" --clobber "$ISO".part*
-            rm -f "$ISO" "$ISO".part* "$ISO".st
+            rm -f "$ISO" "$ISO".part* "$ISO".aria2
             echo "[$BR] 完成 $(date -u +%H:%M:%S)"
           }
 

@@ -16,7 +16,7 @@ upstream:
 # ---- 源镜像：下载地址 + SHA256 的唯一真相源（别处不再重复写） ----
 baseline:
   chunk_mib: 1900                     # 每片上限(MiB)，留余量避开 GitHub 2GB 资产上限
-  threads: 16                         # 下载并发连接数（axel -n）。嫌慢改 32 即可，别处不用动。
+  threads: 16                         # 下载并发连接数（aria2 -x/-s）。嫌慢改 32 即可，别处不用动。
   # sources：一行一条镜像。规则——
   #   * 文件名 = URL 末段（就是微软原版名，契约命名）。分片名 <名>.partN、merge.cmd 里的
   #     EXP_<名> 键、成品 ISO 名，全部由它派生 —— 所以 URL 末段必须就是最终要的名字。
