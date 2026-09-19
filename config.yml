@@ -13,19 +13,24 @@ upstream:
   repo: adavak/Win_ISO_Patching_Scripts
   ref: master
 
-# ---- 源镜像：下载地址 + SHA256 的唯一真相源（别处不再重复写） ----
+# ---- 源镜像：磁力链接 + SHA256 的唯一真相源（别处不再重复写） ----
 baseline:
   chunk_mib: 1900                     # 每片上限(MiB)，留余量避开 GitHub 2GB 资产上限
   # sources：一行一条镜像。规则——
-  #   * 下载文件名自动取 URL 末段（就是微软原版名），不另立命名规则；
-  #   * 各源域名可不同，逐条完整写，不做域名拼接；
+  #   * name   = 产出文件名（微软原版名，契约命名）。分片名 <name>.partN、merge.cmd 里的
+  #              EXP_<name> 键、成品 ISO 名，全部由它派生 —— 所以它必须写死在这，不能靠猜。
+  #   * magnet = 下载用磁力链接（aria2 走 BitTorrent）。各源互相独立，逐条完整写，不做拼接。
+  #             注意：种子内的真实文件名未必等于磁力里的 dn=，以 name 为准。
+  #   * sha256 = 落地后强校验；不符即失败，不会把坏字节切片上传。
   #   * 产物构建份数 = 本清单条数：加一条即多产一份（该分支须在 patchlist.json 有定义）。
   sources:
     - branch: "26100"
-      url: https://download.testip.xyz/windows/zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso
+      name: zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso
+      magnet: "magnet:?xt=urn:btih:b84e74c1dbcc88a02c5b24a6f84383f353a2e1dd&dn=zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso&xl=5287520256"
       sha256: 2CB21649590C8CF770CD93556596DFF4FD800F24D267A9BE9D9CE0EE9E03F5AC
     - branch: "19044"
-      url: https://download.testip.xyz/windows/zh-cn_windows_10_enterprise_ltsc_2021_x64_dvd_033b7312.iso
+      name: zh-cn_windows_10_enterprise_ltsc_2021_x64_dvd_033b7312.iso
+      magnet: "magnet:?xt=urn:btih:366ADAA52FB3639B17D73718DD5F9E3EE9477B40&dn=SW_DVD9_WIN_ENT_LTSC_2021_64BIT_ChnSimp_MLF_X22-84402.ISO&xl=5044211712"
       sha256: C117C5DDBC51F315C739F9321D4907FA50090BA7B48E7E9A2D173D49EF2F73A3
 
 # ---- 组件精简：倾向开关（具体包名清单在 patchlist.json 每分支的 lean） ----

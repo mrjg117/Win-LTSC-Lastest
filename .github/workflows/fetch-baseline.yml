@@ -1,15 +1,16 @@
 name: Fetch Baseline ISO (authoritative mirror)
 
-# 手动触发：按 config.yml 的 baseline.sources 逐条下载官方原版 ISO
-#   -> SHA256 校验 -> RAW 顺序切分（每片 <= baseline.chunk_mib，无压缩）
+# 手动触发：按 config.yml 的 baseline.sources 逐条用 aria2 走 BitTorrent 磁力下载官方原版 ISO
+#   -> SHA256 强校验 -> RAW 顺序切分（每片 <= baseline.chunk_mib，无压缩）
 #   -> 生成内嵌哈希的 merge.cmd -> 上传本仓库 baseline Release。
 #
-# 唯一真相源：下载地址与 SHA256 全部写在 config.yml 的 baseline.sources，别处不再重复。
-# 文件名 = URL 末段（就是微软原版名），不另立命名规则；各源域名可不同，逐条完整写。
+# 唯一真相源：磁力链接与 SHA256 全部写在 config.yml 的 baseline.sources，别处不再重复。
+# 产出文件名 = 该条源的 name 字段（契约命名：分片名、merge.cmd 键、成品 ISO 名都由它派生）。
+# 各源并行下载（互相独立，串行会撑爆 GitHub-hosted runner 的 6 小时硬上限）。
 #
 # baseline Release 内容固定两样（其余残留资产会被本工作流清掉）：
-#   1) <iso 原名>.part1 / .part2 / ...   RAW 字节切片，可直接 copy /b 拼回
-#   2) merge.cmd                          下载方双击即自动重组 + 校验 SHA256
+#   1) <name>.part1 / .part2 / ...   RAW 字节切片，可直接 copy /b 拼回
+#   2) merge.cmd                      下载方双击即自动重组 + 校验 SHA256
 
 on:
   workflow_dispatch:
@@ -20,12 +21,16 @@ permissions:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 600
+    # GitHub-hosted runner 硬上限 6 小时；写更大的值无效（到点仍会按执行上限取消）。
+    timeout-minutes: 360
     steps:
       - name: Checkout（config.yml + merge.cmd 模板）
         uses: actions/checkout@v4
 
-      - name: 下载 / 校验 / RAW 切分 / 上传 baseline
+      - name: 安装 aria2
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends aria2
+
+      - name: 磁力下载 / 校验 / RAW 切分 / 上传 baseline
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -38,13 +43,14 @@ jobs:
           : "${CHUNK_MIB:=1900}"
           echo "分片大小 = ${CHUNK_MIB} MiB"
 
-          # 解析 config.yml 的 baseline.sources -> TSV：branch<TAB>url<TAB>sha256
+          # 解析 config.yml 的 baseline.sources -> TSV：branch<TAB>name<TAB>magnet<TAB>sha256
           ROWS="$(awk '
             /^[a-zA-Z]/ { inb = ($1 == "baseline:") }
-            inb && /- branch:/ { if (b != "") print b "\t" u "\t" s; b = $3; u = ""; s = "" }
-            inb && /^[[:space:]]+url:/    { u = $2 }
+            inb && /- branch:/ { if (b != "") print b "\t" n "\t" m "\t" s; b = $3; n = ""; m = ""; s = "" }
+            inb && /^[[:space:]]+name:/   { n = $2 }
+            inb && /^[[:space:]]+magnet:/ { m = $2 }
             inb && /^[[:space:]]+sha256:/ { s = $2 }
-            END { if (b != "") print b "\t" u "\t" s }
+            END { if (b != "") print b "\t" n "\t" m "\t" s }
           ' config.yml)"
           if [ -z "$ROWS" ]; then
             echo "ERROR: config.yml 的 baseline.sources 为空或无法解析"
@@ -52,33 +58,89 @@ jobs:
           fi
           echo "清单条数 = $(printf '%s\n' "$ROWS" | grep -c .)"
 
-          NOTES=$'官方 LTSC ISO 原版镜像（未改装，微软原始发行版）。\n\n分片沿用微软原名：<iso 原名>.part1 / .part2 / … 为 RAW 字节切片（无压缩、非 7z），顺序拼接即为原 ISO。\n\n下载后把同一分支的全部分片与 merge.cmd 放进同一目录，双击 merge.cmd 即自动重组并校验 SHA256（期望值已内嵌在 merge.cmd 中，无需另找校验文件）。'
+          NOTES=$'官方 LTSC ISO 原版镜像（未改装，微软原始发行版）。\n\n分片沿用原名：<name>.part1 / .part2 / … 为 RAW 字节切片（无压缩、非 7z），顺序拼接即为原 ISO。\n\n下载后把同一分支的全部分片与 merge.cmd 放进同一目录，双击 merge.cmd 即自动重组并校验 SHA256（期望值已内嵌在 merge.cmd 中，无需另找校验文件）。'
 
           # 幂等：每一波上传前调用一次 —— 有则引用、无则现建。
-          # 刻意不在这里提前建：后面的下载要十几分钟，中途 release 若被删（人为清理/误删），
-          # 提前建就是白建，等到上传时才发现 404。放在上传前一刻，危险窗口≈0。
+          # 也容忍并发：多路同时现建时其中一个必然失败，视为「已被别的路建好」即可。
           ensure_release() {
-            gh release view baseline --repo "$REPO" >/dev/null 2>&1 \
-              || gh release create baseline --repo "$REPO" --title baseline --notes "$NOTES"
+            gh release view baseline --repo "$REPO" >/dev/null 2>&1 && return 0
+            gh release create baseline --repo "$REPO" --title baseline --notes "$NOTES" >/dev/null 2>&1 || true
+            gh release view baseline --repo "$REPO" >/dev/null 2>&1
           }
 
-          EXP_LINES=""
-          while IFS=$'\t' read -r BR URL SHA; do
-            [ -z "$URL" ] && continue
-            BR="$(printf '%s' "$BR" | tr -d '"')"
-            SHA="$(printf '%s' "$SHA" | tr -d '"' | tr 'a-f' 'A-F')"
-            ISO="$(basename "$URL")"
+          # 单条源：磁力下载 -> 改回契约名 -> SHA256 -> RAW 切分 -> 上传分片
+          fetch_one() {
+            local BR="$1" ISO="$2" MAGNET="$3" SHA="$4"
+            local WORK="dl/$BR" GOT
+            mkdir -p "$WORK"
             echo "=============================================================="
-            echo "[$BR] $ISO"
-            curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o "$ISO" "$URL"
+            echo "[$BR] 磁力下载 -> $ISO   开始 $(date -u +%H:%M:%S)"
+
+            # BitTorrent 三个必需/关键点：
+            #   --seed-time=0        下完立刻退出。不设会一直做种，job 永远不结束。
+            #   --bt-stop-timeout=N  连续 N 秒零速度即放弃。否则没 peer 时会干等到 6h 被砍，
+            #                        连失败原因都看不到。
+            #   刻意不用 --out：种子内部的真实文件名未必等于磁力里的 dn=，落地后自己改名最稳。
+            #
+            # 进度可见性（Actions 网页端实时日志）：
+            #   --show-console-readout=false  关掉 \r 自刷新那一行 —— 它在网页日志里只会挤成
+            #                                 一堆残影，看不出进度。
+            #   --summary-interval=15         改成每 15 秒定格打印一个进度块（含百分比/速度/ETA），
+            #                                 网页端滚动日志里一行行看得很清楚。
+            aria2c \
+              --dir="$WORK" \
+              --seed-time=0 \
+              --bt-stop-timeout=600 \
+              --enable-dht=true \
+              --bt-max-peers=100 \
+              --check-integrity=true \
+              --file-allocation=none \
+              --max-tries=0 --retry-wait=5 \
+              --show-console-readout=false \
+              --summary-interval=15 \
+              --human-readable=true \
+              --console-log-level=notice \
+              "$MAGNET"
+
+            GOT="$(find "$WORK" -maxdepth 1 -type f -size +100M -printf '%s\t%p\n' | sort -rn | head -1 | cut -f2-)"
+            [ -n "$GOT" ] || { echo "ERROR: $BR 未产出 ISO"; ls -la "$WORK"; return 1; }
+            mv -f -- "$GOT" "$ISO"
+
+            echo "[$BR] 下载完成 $(date -u +%H:%M:%S)  $(stat -c '%s' "$ISO") bytes，开始 SHA256 校验"
             echo "$SHA  $ISO" | sha256sum -c -
             rm -f "$ISO".part*
             split -b "${CHUNK_MIB}M" -a 1 --numeric-suffixes=1 "$ISO" "$ISO.part"
             ls -l "$ISO".part*
             ensure_release
             gh release upload baseline --repo "$REPO" --clobber "$ISO".part*
-            rm -f "$ISO" "$ISO".part*
-            EXP_LINES="${EXP_LINES}set \"EXP_${ISO}=${SHA}\""$'\n'
+            rm -rf "$WORK" "$ISO" "$ISO".part*
+            echo "[$BR] 完成 $(date -u +%H:%M:%S)"
+          }
+
+          # 各源并行下载（互不相干；串行会把两个 ISO 塞进同一个 6h 预算里，必挂）
+          pids=()
+          while IFS=$'\t' read -r BR NAME MAG SHA; do
+            [ -z "$MAG" ] && continue
+            BR="$(printf '%s' "$BR" | tr -d '"')"
+            NAME="$(printf '%s' "$NAME" | tr -d '"')"
+            MAG="$(printf '%s' "$MAG" | tr -d '"')"
+            SHA="$(printf '%s' "$SHA" | tr -d '"' | tr 'a-f' 'A-F')"
+            [ -n "$NAME" ] || { echo "ERROR: 分支 $BR 缺 name 字段"; exit 1; }
+            fetch_one "$BR" "$NAME" "$MAG" "$SHA" &
+            pids+=($!)
+          done <<< "$ROWS"
+
+          fail=0
+          for p in "${pids[@]}"; do wait "$p" || fail=1; done
+          [ "$fail" -eq 0 ] || { echo "ERROR: 有源的下载/校验失败"; exit 1; }
+
+          # merge.cmd：期望哈希逐条内嵌（纯由 config.yml 派生，与下载结果无关）
+          EXP_LINES=""
+          while IFS=$'\t' read -r BR NAME MAG SHA; do
+            [ -z "$MAG" ] && continue
+            NAME="$(printf '%s' "$NAME" | tr -d '"')"
+            SHA="$(printf '%s' "$SHA" | tr -d '"' | tr 'a-f' 'A-F')"
+            EXP_LINES="${EXP_LINES}set \"EXP_${NAME}=${SHA}\""$'\n'
           done <<< "$ROWS"
 
           mkdir -p dist
@@ -91,7 +153,7 @@ jobs:
 
           gh release view baseline --repo "$REPO" --json assets --jq '.assets[].name' | while read -r a; do
             [ -z "$a" ] && continue
-            if ! printf '%s' "$a" | grep -Eq '\.iso\.part[0-9]+$|^merge\.cmd$'; then
+            if ! printf '%s' "$a" | grep -Eqi '\.part[0-9]+$|^merge\.cmd$'; then
               echo "清理基线残留资产: $a"
               gh release delete-asset baseline "$a" --repo "$REPO" --yes
             fi

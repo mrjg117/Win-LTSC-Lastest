@@ -56,13 +56,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 解析 config.yml 的 baseline.sources -> TSV：branch<TAB>url<TAB>sha256
+          # 解析 config.yml 的 baseline.sources -> TSV：branch<TAB>name<TAB>sha256
+          # （name 就是产出原版 ISO 的文件名契约，分片名/merge.cmd 键/成品名都从它派生）
           ROWS="$(awk '
             /^[a-zA-Z]/ { inb = ($1 == "baseline:") }
-            inb && /- branch:/ { if (b != "") print b "\t" u "\t" s; b = $3; u = ""; s = "" }
-            inb && /^[[:space:]]+url:/    { u = $2 }
+            inb && /- branch:/ { if (b != "") print b "\t" n "\t" s; b = $3; n = ""; s = "" }
+            inb && /^[[:space:]]+name:/   { n = $2 }
             inb && /^[[:space:]]+sha256:/ { s = $2 }
-            END { if (b != "") print b "\t" u "\t" s }
+            END { if (b != "") print b "\t" n "\t" s }
           ' config.yml)"
           if [ -z "$ROWS" ]; then
             echo "::error::config.yml 的 baseline.sources 为空或无法解析"
@@ -71,11 +72,12 @@ jobs:
 
           MATRIX="["
           SEP=""
-          while IFS=$'\t' read -r BR URL SHA; do
-            [ -z "$URL" ] && continue
+          while IFS=$'\t' read -r BR NAME SHA; do
+            [ -z "$NAME" ] && continue
             BR="$(printf '%s' "$BR" | tr -d '"')"
+            NAME="$(printf '%s' "$NAME" | tr -d '"')"
             SHA="$(printf '%s' "$SHA" | tr -d '"' | tr 'a-f' 'A-F')"
-            ISO="$(basename "$URL")"
+            ISO="$NAME"
             # 该分支必须在 patchlist.json 有定义（构建引擎按分支取 build/sku/lean）
             LABEL="$(python3 -c "import json,sys;d=json.load(open('patchlist.json',encoding='utf-8-sig'));print(d.get('branches',{}).get(sys.argv[1],{}).get('label',''))" "$BR")"
             if [ -z "$LABEL" ]; then
