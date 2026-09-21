@@ -82,17 +82,22 @@ jobs:
             #   --file-allocation=none  不预分配，写大文件不白等
             #   --summary-interval=0    关掉周期性汇总块，只留每秒一行的读秒
             #   --auto-file-renaming=false --allow-overwrite=true  重跑时覆盖同名文件而非改名
-            # 进度在网页端为何是「一行一行往下滚」而不是刷屏：
-            #   aria2 按 stdout 是否终端（isatty）分两种输出。CI 里被管道接管 = 非终端，
-            #   它每秒输出一行纯文本（[#5c324e 240MiB/4.9GiB(4%) CN:16 DL:17MiB ETA:4m40s]）
-            #   并补一个换行；终端下那套 \r 原地覆盖的动画不会启用，故不会出现满屏空白。
+            #
+            # 必须套 stdbuf + sed -u —— 少任何一个，网页日志里就「完全没有进度」（实测过）：
+            #   aria2 的读秒行走 global::cout，而 ConsoleStatCalc 只在 isTTY_ 为真时才调 flush()；
+            #   CI 里 stdout 被管道接管 -> isTTY_ 假 -> 只 write 不 flush -> 落进 stdio 块缓冲，
+            #   攒满 4 KiB 才吐一次。第二层缓冲在 sed：它输出到管道同样块缓冲。
+            #   实测（WSL Linux + aria2 1.37.0，同参数跑 12 秒）：
+            #     不加 stdbuf：12 行进度全堆在 11.99s（进程被杀退出时才 flush）→ 日志全程空白；
+            #     加 stdbuf -oL -eL：1.18s / 2.17s / 3.30s … 每秒一行实时可见，且 0 个 \r。
+            #   非终端分支不产生 \r，所以是一行一行往下滚，不会刷屏。
             # 断点续传：aria2 在目标旁留 .aria2 控制文件，中断后重跑同一命令即从断点继续。
             local try
             for try in 1 2 3 4 5; do
-              aria2c -x"$THREADS" -s"$THREADS" -k1M \
+              stdbuf -oL -eL aria2c -x"$THREADS" -s"$THREADS" -k1M \
                      --file-allocation=none --summary-interval=0 \
                      --auto-file-renaming=false --allow-overwrite=true \
-                     -d . -o "$ISO" "$URL" 2>&1 | sed "s/^/[$BR] /" && break
+                     -d . -o "$ISO" "$URL" 2>&1 | sed -u "s/^/[$BR] /" && break
               echo "[$BR] 第 ${try} 次中断 $(date -u +%H:%M:%S)，5 秒后续传"
               sleep 5
             done
