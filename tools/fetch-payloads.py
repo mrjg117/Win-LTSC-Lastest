@@ -4,8 +4,14 @@
 按 config.json 抓取「声明式载荷」到工作目录，供 delta 脚本消费。
 
 两类载荷：
-  components —— 每个「名字: 链接」抓一个文件到 assets/redist/<名字><扩展名>
-                 例：vc14_x64 → assets/redist/vc14_x64.exe       （03 按名字找文件）
+  optimize.components —— 每个「名字: 链接」抓一个文件到 assets/redist/<名字><扩展名>
+                 例：vc14_x64 → assets/redist/vc14_x64.exe
+                 .zip 若内含唯一 .exe/.msi 则就地解出内层安装器（外层丢弃）
+                 落盘名 = <名字><扩展名>，07 正是靠 "名字.*" 通配取回它，两边必须一致
+                 本脚本只负责下载；「安装还是解包」由 07.Bake-Image 按扩展名分流。
+                 .zip 分发包装载（MPC-BE 官方 installer.zip 就是这种）：外层 zip 只是打包，
+                 里面才是真安装器 —— 这里就地解开、只留内层 .exe/.msi，
+                 免得把「一个 zip」当成安装包去写静默命令行。
   apps       —— 清单里写一行装一个，落成 assets/apps/<键>/ 目录，并写 apps-manifest.json
                  · 12 位 Store 产品 ID → 经 rg-adguard 换出微软官方 CDN 直链（含依赖框架）
                  · 含 :// 的完整直链   → 直接下载
@@ -26,10 +32,19 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+# Windows runner 的 l10n 是 en-US，Python 3.12 的 stdout 会回退到 cp1252 —— 一 print 中文就抛
+# UnicodeEncodeError 把整个 step 打挂（CI 实测：日志里 `下载组件 …` 那一行直接炸）。
+# 显式把标准流切到 UTF-8，脚本在任何宿主（cp1252 / cp936 / POSIX）上都能安全输出中文。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:                       # noqa: BLE001 - 被重定向成非 TextIOWrapper 时忽略
+        pass
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -101,10 +116,46 @@ def download(url, path, expect_size=None):
 
 # ---------------- components ----------------
 
+# 安装器扩展名：07.Bake-Image 会为这些生成静默安装命令行。
+INSTALLER_EXT = (".exe", ".msi")
+
+
+def unwrap_installer(path):
+    """若 path 是「装安装器的 zip」，就地解出唯一的安装器并返回其路径；否则原样返回。
+
+    MPC-BE 官方只发 MPC-BE.1.9.1.x64-installer.zip，里面就一个 MPC-BE.1.9.1.x64.exe。
+    外层 zip 如果不是这种形态（没有安装器 / 有多个），就原样保留并返回 None ——
+    07 那边会按扩展名报错，绝不猜。
+    """
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = [n for n in z.namelist() if not n.endswith("/")]
+            installers = [n for n in names if n.lower().endswith(INSTALLER_EXT)]
+            if len(installers) != 1:
+                log(f"  ZIP 里安装器数量不是 1（{len(installers)}），按原样保留")
+                return None
+            inner = installers[0]
+            out = os.path.join(os.path.dirname(path),
+                               os.path.basename(inner))
+            log(f"  解包 ZIP -> {os.path.basename(out)}（内层安装器）")
+            with z.open(inner) as src, open(out, "wb") as dst:
+                while True:
+                    buf = src.read(1 << 20)
+                    if not buf:
+                        break
+                    dst.write(buf)
+        # [必须放在 with 之外] Windows 上 ZipFile 未关闭时文件仍被占用，
+        # 在里面 os.remove 会 PermissionError: [WinError 32]
+        os.remove(path)
+        return out
+    except zipfile.BadZipFile:
+        return None
+
+
 def fetch_components(cfg, dest):
-    comps = cfg.get("components") or {}
+    comps = ((cfg.get("optimize") or {}).get("components")) or {}
     if not comps:
-        log("components 为空，跳过")
+        log("optimize.components 为空，跳过")
         return []
     outdir = os.path.join(dest, "assets", "redist")
     saved = []
@@ -116,6 +167,10 @@ def fetch_components(cfg, dest):
         else:
             log(f"下载组件 {name} <- {url}")
             download(url, path)
+        if path.lower().endswith(".zip"):
+            inner = unwrap_installer(path)
+            if inner:
+                path = inner
         saved.append(path)
     return saved
 
@@ -141,8 +196,13 @@ def rg_list(product_id):
         if low.endswith(SKIP_EXT):
             continue
         if not low.endswith(PKG_EXT):
+            # 注意：加密包 .eappxbundle / .emsixbundle 天然落在这里被丢掉 ——
+            # 它们无法用于 DISM 离线预置（媒体播放器那种产品 ID 会同时给出加密与明文两份）。
             continue
         if "_arm_" in low or "_arm64_" in low or low.endswith("_arm64"):
+            continue
+        if "_x86_" in low:
+            # 目标映像是 x64，DISM 预置只认匹配架构的依赖包；x86 那份纯属白下
             continue
         nbytes = 0
         msz = re.match(r"([\d.]+)\s*(KB|MB|GB)", size.strip(), re.I)
@@ -152,6 +212,24 @@ def rg_list(product_id):
     if not items:
         fail(f"rg-adguard 返回里没有可用的包（产品 ID {product_id}）")
     return items
+
+
+def is_x64_or_neutral(fname):
+    """主包候选的架构优先级：bundle 常带 _neutral_，拆开的单包带 _x64_。"""
+    low = fname.lower()
+    return "_x64_" in low or "_neutral_" in low
+
+
+def pkg_version(fname):
+    """从包名里取 4 段版本号（如 ..._22608.1401.3.0_neutral_...）；取不到返回 ()。
+
+    [为什么不用体积排序] 同一产品 ID 会同时给出历史版本，而"最新版"并不总是最大那个：
+    实测 Media Player 按体积会选到 2019 年的 48.5 MB 包，而现行版 11.2607.16.0 只有 38.4 MB。
+    """
+    m = re.search(r"_(\d+(?:\.\d+){0,3})_", fname)
+    if not m:
+        return ()
+    return tuple(int(x) for x in m.group(1).split("."))
 
 
 def classify(items):
@@ -215,16 +293,18 @@ def fetch_apps(cfg, dest, branch, list_only=False):
         else:
             log(f"解析 Store 产品 ID {value}")
             mains, deps = classify(rg_list(value))
-            # 多主包（同一应用的多架构/多版本）优先取 x64/neutral，其次取最大的
-            mains.sort(key=lambda x: (("_x64_" in x[0].lower() or "_neutral_" in x[0].lower()), x[2]),
-                       reverse=True)
-            for fname, url, size in [mains[0]] + deps:
+            # 多主包（同一应用的多个版本/架构）：先要 x64/neutral，再取版本号最大的那个。
+            # 刻意不按体积排（见 pkg_version 的说明）。
+            mains.sort(key=lambda x: (is_x64_or_neutral(x[0]), pkg_version(x[0])), reverse=True)
+            pick = mains[0]
+            log(f"  选中主包 {pick[0]}（候选 {len(mains)} 个，按 x64/neutral + 版本号降序取首）")
+            for fname, url, size in [pick] + deps:
                 path = os.path.join(adir, fname)
                 if os.path.isfile(path) and os.path.getsize(path) > 0:
                     log(f"SKIP 已存在: {key}/{fname}")
                 else:
                     download(url, path, expect_size=size)
-            rec["main"].append(os.path.relpath(os.path.join(adir, mains[0][0]), dest).replace("\\", "/"))
+            rec["main"].append(os.path.relpath(os.path.join(adir, pick[0]), dest).replace("\\", "/"))
             for fname, _u, _s in deps:
                 rec["deps"].append(os.path.relpath(os.path.join(adir, fname), dest).replace("\\", "/"))
 

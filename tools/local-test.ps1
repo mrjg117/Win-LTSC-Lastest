@@ -5,7 +5,7 @@
   - 必须在【管理员 PowerShell】中运行（本构建沙箱无管理员令牌，DISM 会被 Error 740 拦截）。
   - 不修改原 ISO：会把 install.wim 复制到临时目录再挂载 RW 测试，测完 /Discard 丢弃。
   - 覆盖最易出错的几处：
-      0) 99.Force-W10UI-Ini 的 ini 强制写回（红线=0 / 组A=1 / 未命中行不变 / 无BOM / 幂等）
+      0) 99.Force-W10UI-Ini 的 ini 强制写回（红线=0 / optimize.ini=1 / 未命中行不变 / 无BOM / 幂等）
          —— 这一步不依赖 ISO，几秒完成（本文件其余步骤都要 ISO + 管理员）
       1) 01.Build-Manifest 的 build 读法（Version 取末段，不能整串转 int）
       2) 06.Assert-UBR 的离线注册表 UBR 读法
@@ -51,8 +51,8 @@ $fake = @('; synthetic upstream ini','[Options]','wim2esd=1','ResetBase=1') +
         @($grpA | ForEach-Object { "$_=0" }) + @('netfx3=1','')
 [IO.File]::WriteAllBytes((Join-Path $t99 'W10UI.ini'),
                          [Text.Encoding]::GetEncoding(28591).GetBytes((($fake -join "`r`n") + "`r`n")))
-# config.json 只需 optimize_ini 字段（99 只读它；顺带覆盖「带 BOM 的 UTF-8」读取路径）
-('{"optimize_ini":["' + (@($grpA) -join '","') + '"]}') |
+# config.json 只需 optimize.ini 字段（99 只读它；顺带覆盖「带 BOM 的 UTF-8」读取路径）
+('{"optimize":{"ini":["' + (@($grpA) -join '","') + '"]}}') |
     Set-Content (Join-Path $t99 'config.json') -Encoding UTF8
 $script99 = Join-Path $PSScriptRoot '..\delta\lib\99.Force-W10UI-Ini.ps1'
 try {
@@ -173,11 +173,63 @@ $toolsDir   = Join-Path $bakeDir 'Tools'
 New-Item -ItemType Directory -Force -Path $pantherDir,$toolsDir | Out-Null
 '<unattend/>'    | Set-Content (Join-Path $pantherDir 'unattend.xml')   -Encoding utf8
 '@echo off'      | Set-Content (Join-Path $toolsDir   '激活系统.cmd')   -Encoding ascii
-'@echo off'      | Set-Content (Join-Path $toolsDir   '安装运行库.cmd') -Encoding ascii
 $ok1 = Test-Path (Join-Path $pantherDir 'unattend.xml')
 $ok2 = Test-Path (Join-Path $toolsDir   '激活系统.cmd')
 dism.exe /Unmount-Image /MountDir:"$bakeDir" /Commit 2>&1 | Out-Null
 Log "  结果: 文件烤入 $(if($ok1 -and $ok2){'OK'}else{'FAIL'})（unattend.xml / C:\Tools 均落入映像）"
+
+# ---- 7b) 测试 07 的 optimize.registry 解析与 {ext} 展开 ----
+#   刻意从 07.Bake-Image.ps1 源码里抽函数来跑（测的是原件，不是副本，避免两处漂移）
+Log "=== 测试 07 的 registry 解析 / {ext} 展开（抽 07 源码里的函数实跑）==="
+try {
+    $bakeSrc = Get-Content (Join-Path $PSScriptRoot '..\delta\lib\07.Bake-Image.ps1') -Raw
+    $fns = @([regex]::Matches($bakeSrc,
+             '(?ms)^function (?:ConvertFrom-RegLine|Expand-RegPut|Get-RegistryActions) \{.*?^\}') |
+             ForEach-Object { $_.Value })
+    if ($fns.Count -lt 3) { throw "没能从 07.Bake-Image.ps1 里抽出 3 个函数（实际 $($fns.Count) 个）" }
+    foreach ($fn in $fns) { Invoke-Expression $fn }
+
+    $okParse = $true
+    # 1) 基本解析：type 自动补 REG_ 前缀；value 里的竖线不被切开
+    try {
+        $p = ConvertFrom-RegLine -Line 'SOFTWARE|Some\Path|Val|DWORD|1' -Where 'test'
+        if ($p.type -ne 'REG_DWORD' -or $p.value -ne '1') { $okParse = $false }
+        $p2 = ConvertFrom-RegLine -Line 'SOFTWARE|P|N|SZ|a|b|c' -Where 'test'
+        if ($p2.value -ne 'a|b|c') { $okParse = $false }
+        # 2) 段数不足必须抛错（不静默）
+        $threw = $false
+        try { ConvertFrom-RegLine -Line 'SOFTWARE|P|N|SZ' -Where 'test' } catch { $threw = $true }
+        if (-not $threw) { $okParse = $false }
+    } catch { $okParse = $false }
+    Log "  解析: $(if($okParse){'OK'}else{'FAIL'})（补 REG_ 前缀 / value 含竖线 / 段数不足报错）"
+
+    # 3) {ext} 展开：3 个取值 -> 3 条；无 {ext} 原样返回；清单为空必须抛错
+    $put = [pscustomobject]@{ hive='SOFTWARE'; path='P\{ext}'; name='{ext}'; type='REG_SZ'; value='V' }
+    $exp = @(Expand-RegPut -Put $put -Extensions @('.a','.b','.c'))
+    $plain = [pscustomobject]@{ hive='SOFTWARE'; path='P'; name='N'; type='REG_SZ'; value='V' }
+    $noexp = @(Expand-RegPut -Put $plain -Extensions @('.a'))
+    $threw2 = $false
+    try { Expand-RegPut -Put $put -Extensions @() | Out-Null } catch { $threw2 = $true }
+    $okExt = ($exp.Count -eq 3) -and ($exp[0].path -eq 'P\.a') -and ($exp[2].name -eq '.c') -and
+             ($noexp.Count -eq 1) -and $threw2
+    Log "  展开: $(if($okExt){'OK'}else{'FAIL'})（3 取值->3 条 / 无占位符原样 / 空清单报错）"
+
+    # 4) 用真 config.json 的 photo_viewer_legacy 跑一遍：5 条 puts 应展开成 4+13=17 条
+    $cfgPath = Join-Path $PSScriptRoot '..\config.json'
+    if (Test-Path $cfgPath) {
+        $cfgT = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $item = @($cfgT.optimize.registry) | Where-Object { $_.name -eq 'photo_viewer_legacy' }
+        $exts = @(@($cfgT.optimize._extensions) | ForEach-Object { [string]$_ })
+        $acts = @(Get-RegistryActions -Item $item -Extensions $exts)
+        $fa = @($acts | Where-Object { $_.path -like '*FileAssociations*' })
+        $okPv = ($acts.Count -eq 17) -and ($fa.Count -eq $exts.Count)
+        Log "  photo_viewer_legacy: $(if($okPv){'OK'}else{'FAIL'})（展开 $($acts.Count) 条，其中 FileAssociations $($fa.Count) 条）"
+    } else {
+        Log "  跳过真 config 验证：先跑 tools/config-to-json.py 生成 config.json"
+    }
+} catch {
+    Log "  结果: FAIL $($_.Exception.Message)"
+}
 
 # ---- 8) 清理 ----
 dism.exe /Unmount-Image /MountDir:"$mountDir" /Discard 2>&1 | Out-Null

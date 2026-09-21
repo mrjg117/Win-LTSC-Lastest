@@ -55,15 +55,19 @@ branches:
     #   刻意用产品名而不是 build 号 —— 按 build 号搜会把 Server 版同名 build 混进来
     #   （实测 26100 那页里 Server 是 26100.33451，真客户端是 26100.9457）。
     detect: Windows 11, version 24H2
-    remove:                           # 本分支额外卸（与上方全局 remove 合并）
-      - Media.Playback~~~~0.0.1.0
+    # remove:                         # 本分支额外卸（与上方全局 remove 合并）。不写 = 只吃全局表
+    #   [别加 Media.Playback~~~~0.0.1.0] 它看着像"WMP 开关"，实际是整个 Media Feature Pack：
+    #   WMP + Media Foundation + 全套音视频编解码（MPEG / WMA / AAC / FLAC / AC-3…）+ WPD 便携设备。
+    #   卸掉它，Edge / 照片 / Teams / 摄像头 / 语音输入会一并坏掉；WMP 本体由独立的系统
+    #   removable package `Microsoft-Windows-MediaPlayback-OC`（Package Size 0 KB 的纯开关）管理。
     apps:                             # 本分支应用（与上方全局 apps 合并去重）
       - 9WZDNCRFJBMP                  # Microsoft Store（LTSC 出厂不带）
-      - 9PCFS5B6T72H                  # 画图 Paint
-      - 9MSMLRH6LZF3                  # 记事本 Windows Notepad
-      - 9WZDNCRFJ3PT                  # 媒体播放器 Windows Media Player
-      # 以上为 Win11 版本线的包；同一产品 ID 在官方接口下按目标 OS 返回不同 PackageSet，
-      # Win10 分支要用它自己那条线（见下方 19044）。
+      # 其余一律不再预置商店包 —— 这几项改用「系统自带老组件 + 免安装工具」：
+      #   画图 / 记事本 —— LTSC 出厂自带经典版（mspaint.exe / notepad.exe），不用补；
+      #     商店版是 AI 重型包（Paint bundle 722 MB，其中 330 MB 是 .onnxe 模型权重）
+      #   播放器 —— components 段的 MPC-BE（自带全解码、HDR/DV，比 WMP+解码包更小更好）
+      #   解压   —— components 段的 7-Zip 26.03（NanaZip 虽同为 7-Zip 内核，但 MSIX 形态有
+      #     盘符右键仅 Win11、首启需联网取 license、AppData 重定向等硬限制）
   "19044":
     label: Win10-LTSC-2021
     edition: IoTEnterpriseS
@@ -74,71 +78,157 @@ branches:
     remove:
       - MicrosoftWindowsPowerShellV2
       - MicrosoftWindowsPowerShellV2Root
-    # Win10 分支的应用写在下面（与全局 apps 合并去重）。注意：
-    #   新版 MSIX 的 MinVersion 钉 Windows 11，强注报 0x80073cfd；
-    #   要装就用 Win10 版本线的包（同一产品 ID 在官方接口下另有 Windows 10 的 PackageSet），
-    #   或改用直链。留空 = 本分支不预装任何应用。
-    # apps:
-    #   - 9WZDNCRFJBMP                # 例：Store（须为 Win10 线包，落地前先实体实测）
+    # 应用与全局 apps 合并去重，写法与 26100 分支相同。
+    apps:
+      - 9WZDNCRFJBMP                  # Microsoft Store
+      # [实测推翻旧结论] 曾以为"新版 MSIX 的 MinVersion 钉 Windows 11，Win10 装不上"。
+      #   实测现行包 Microsoft.WindowsStore_22608.1401.3.0 的 TargetDeviceFamily：
+      #     MinVersion = 10.0.18362.0（Win10 1903）、MaxVersionTested = 10.0.26100.0
+      #   19044 > 18362，满足 —— 两个分支共用同一产品 ID 即可。
+      #   同一产品 ID 下另有旧线 11811.1001.2713.0 / 12107.1001.15.0（appxbundle 形态，
+      #   MinVersion 10.0.14393 / 10.0.16299）；只有在新包被下架时才需要回退到它们。
 
 # ---- SKU 转换用的 KMS GVLK（微软官方文档所列，一般不用改）----
 gvlk:
   IoTEnterpriseS: KBN8V-HFGQ4-MGXVD-347P6-PDQGT   # Windows IoT Enterprise LTSC 2024 / 2021 通用
   EnterpriseS:    M7XTQ-FN8P6-TTKYV-9D4CC-J462D   # Windows 11 / 10 Enterprise LTSC（备用）
 
-# ---- 集成组件：名字: 链接。写了 = 构建期下载并烤进 C:\Tools\redist（附一键安装入口）；注释 / 不写 = 不做 ----
-# 说明：DISM /Add-Package 只接受 .cab/.msu，而 VC++ 可再发行包是 MSI/exe —— 官方口径明确
-#       不能这样离线集成，唯一官方途径是部署后静默安装（/install /quiet /norestart）。
-#       所以这里是「下载 → 烤进 C:\Tools\redist → 生成 C:\Tools\安装运行库.cmd」，不注入镜像组件存储。
-components:
-  vc14_x64: https://aka.ms/vs/17/release/vc_redist.x64.exe
-  vc14_x86: https://aka.ms/vs/17/release/vc_redist.x86.exe
-  # dotnet8: https://...
+# ---- 优化 / 组件：全在本段，写了就生效；注释 / 不写 = 不做 ----
+# 三个子键，各对应一种落地方式（执行器不同）：
+#   ini        上游 W10UI.ini 开关名 → 99 把该键置 1 写回上游 ini（上游自己注入镜像）
+#   registry   离线 hive 注册表写入 → 07 挂载镜像时 reg load → 按表写 → unload
+#   components 桌面向导组件安装器   → 07 写进 unattend，首次开机静默装到官方默认目录
+#
+# registry 的值格式（竖线分隔，五段）：
+#     hive|path|name|type|value
+#   hive   SYSTEM / SOFTWARE / DEFAULT（DEFAULT = Users\Default\NTUSER.DAT）
+#   path   注册表路径；{CS} = 该 hive 里所有 ControlSetNNN
+#          （离线 hive 没有 CurrentControlSet，那是运行时符号链接，必须写 ControlSetNNN）
+#   name   值名；留空 = 该键的默认值
+#   type   DWORD / SZ / EXPAND_SZ
+#   value  值；DWORD 写数字，其余直接写
+#   路径/值里其它的花括号（CLSID、{FFE2A43C-…}）是路径本身的一部分，不是占位符。
+#
+# 一个开关要写多条时，写成列表：
+#     name:
+#       - "第一条"
+#       - "第二条"
+# 含 {ext} 的行 = 展开型：对下方 _extensions 里的每个扩展名各写一次
+# （photo_viewer_legacy 靠它把 13 个扩展名关联一行写完，不用手抄 13 行）。
+optimize:
+
+  # ===== 上游 W10UI 开关（行为由上游实现，我们只置 1）=====
+  ini:
+    nosuggapp:  禁第三方应用静默安装
+    nosuggtip:  禁「建议 / Spotlight / 锁屏聚焦 / 搜索框推荐」
+    norestorage: 关预留存储
+    nogamebar:  关 Xbox Game Bar
+    oobebypass: OOBE 免联网建本地账户
+    UpdtBootFiles: 更新 ISO 引导文件 + UEFI CA 2023 新安全启动证书（旧 CA 2026-06 已到期）
+
+  # ===== 离线 hive 注册表写入（构建期写进镜像，装完即生效）=====
+  # --- 电源与性能 ---
+  registry:
+    disable_hibernate:    "SYSTEM|{CS}\\Control\\Power|HibernateEnabled|DWORD|0"                    # 关休眠
+    disable_faststartup:  "SYSTEM|{CS}\\Control\\Session Manager\\Power|HiberbootEnabled|DWORD|0"   # 关快速启动
+
+    # --- 隐私（Policies 路径 = 硬锁，用户改不回去）---
+    disable_telemetry:    "SOFTWARE|Policies\\Microsoft\\Windows\\DataCollection|AllowTelemetry|DWORD|0"                    # 关遥测
+    no_consumer_features: "SOFTWARE|Policies\\Microsoft\\Windows\\CloudContent|DisableWindowsConsumerFeatures|DWORD|1"     # 关消费者体验
+    no_spotlight:         "SOFTWARE|Policies\\Microsoft\\Windows\\CloudContent|DisableWindowsSpotlightFeatures|DWORD|1"    # 关 Windows 聚焦
+    no_advertising_id:    "SOFTWARE|Policies\\Microsoft\\Windows\\AdvertisingInfo|DisabledByGroupPolicy|DWORD|1"           # 关广告 ID
+    no_feedback:          "SOFTWARE|Policies\\Microsoft\\Windows\\DataCollection|DoNotShowFeedbackNotifications|DWORD|1"   # 关反馈通知
+
+    # --- 界面（默认用户 hive = 软默认，用户可自己改回）---
+    show_file_extensions: "DEFAULT|Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced|HideFileExt|DWORD|0"   # 显示文件扩展名
+    show_hidden_files:    "DEFAULT|Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced|Hidden|DWORD|1"        # 显示隐藏文件
+    taskbar_align_left:   "DEFAULT|Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced|TaskbarAl|DWORD|0"    # Win11 任务栏左对齐
+    classic_context_menu: "DEFAULT|Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\\InprocServer32||SZ|"  # Win11 经典右键菜单
+    numlock_on:           "DEFAULT|Control Panel\\Keyboard|InitialKeyboardIndicators|SZ|2"                                # 小键盘开机默认亮
+
+    # --- 安全与兼容 ---
+    no_bitlocker_auto:     "SYSTEM|{CS}\\Control\\BitLocker|PreventDeviceEncryption|DWORD|1"        # 禁 BitLocker 自动加密
+    allow_all_trusted_apps: "SOFTWARE|Policies\\Microsoft\\Windows\\Appx|AllowAllTrustedApps|DWORD|1"  # 允许预置非 Store 签名包（配合 apps 的 /SkipLicense，必须开）
+
+    # --- 老组件回补 ---
+    # 让经典「Windows 照片查看器」可用（LTSC 不带现代照片应用；PhotoViewer.dll 一直在系统里，
+    # 缺的只是两处 shell 注册）。补完它才会出现在「打开方式」列表里 —— 真正设为默认仍需用户
+    # 自己点一下，因为 UserChoice 带哈希保护，离线写不了。
+    # 值与实测的本机 Win11 24H2 注册表逐字一致；ProgID 一律用 PhotoViewer.FileAssoc.Tiff
+    # （实测 Win10/11 上其余 ProgID 已被移除，只剩这一个还是完整的树）。
+    photo_viewer_legacy:
+      - "SOFTWARE|Classes\\Applications\\photoviewer.dll\\shell\\open|MuiVerb|SZ|@%ProgramFiles%\\Windows Photo Viewer\\photoviewer.dll,-3043"
+      - "SOFTWARE|Classes\\Applications\\photoviewer.dll\\shell\\open\\command||EXPAND_SZ|%SystemRoot%\\System32\\rundll32.exe \"%ProgramFiles%\\Windows Photo Viewer\\PhotoViewer.dll\", ImageView_Fullscreen %1"
+      - "SOFTWARE|Classes\\Applications\\photoviewer.dll\\shell\\open\\DropTarget|Clsid|SZ|{FFE2A43C-56B9-4bf5-9A79-CC6D4285608A}"
+      - "SOFTWARE|Microsoft\\Windows Photo Viewer\\Capabilities|ApplicationName|EXPAND_SZ|@%ProgramFiles%\\Windows Photo Viewer\\PhotoViewer.dll,-3058"
+      - "SOFTWARE|Microsoft\\Windows Photo Viewer\\Capabilities\\FileAssociations|{ext}|SZ|PhotoViewer.FileAssoc.Tiff"
+
+  # 展开型条目的取值清单（只在 registry 里出现 {ext} 时才用得到）
+  _extensions:
+    - .bmp
+    - .dib
+    - .gif
+    - .ico
+    - .jfif
+    - .jpe
+    - .jpeg
+    - .jpg
+    - .jxr
+    - .png
+    - .tif
+    - .tiff
+    - .wdp
+
+  # ===== 组件：名字: 链接。写了 = 构建期下载，首次开机静默装 =====
+  # 说明：DISM /Add-Package 只接受 .cab/.msu，而这些都是 NSIS/Inno 安装器 —— 没有任何官方途径
+  #       在构建期直接写进镜像内部。官方可行落点是「部署后静默安装」：这里写进镜像里的
+  #       unattend.xml（synthesize pass），首次开机由 Windows 自己装一遍，跑完自删。
+  #       得到的是正常安装：装到官方默认目录（C:\Program Files\…）、可卸载、有「应用和功能」条目。
+  # 装法与参数由安装器类型自动判定，判不出即报错（绝不猜，猜错会弹出图形向导而不报错）：
+  #   .msi            → msiexec /i "<文件>" /qn /norestart
+  #   .exe (Inno)     → /VERYSILENT /SP- /SUPPRESSMSGBOXES /NORESTART
+  #   .exe (NSIS)     → /S
+  #   .exe (vc_redist) → /install /quiet /norestart
+  #   .zip            → 内含唯一安装器时自动解出内层 .exe/.msi；其余形态报错
+  # 路径与设置一律走官方默认（不传 /DIR、不传 INSTALLDIR、不动组件勾选）：
+  #   7-Zip  (x64 exe) → C:\Program Files\7-Zip        （官方 FAQ：/S + /D=，两者大小写敏感）
+  #   MPC-BE (x64 安装器) → C:\Program Files\MPC-BE x64 （官方 iss 的 DefaultDirName={pf}\MPC-BE x64）
+  #   NDM    (Inno 5.5.7) → C:\Program Files (x86)\Neat Download Manager（官方安装器默认，实测确认）
+  components:
+    vc14_x64: https://aka.ms/vs/17/release/vc_redist.x64.exe
+    vc14_x86: https://aka.ms/vs/17/release/vc_redist.x86.exe
+    7zip:     https://github.com/ip7z/7zip/releases/download/26.03/7z2603-x64.exe
+    mpcbe:    https://github.com/Aleksoid1978/MPC-BE/releases/download/1.9.1/MPC-BE.1.9.1.x64-installer.zip
+    ndm:      https://www.neatdownloadmanager.com/file/NeatDM_setup.exe
+    # dotnet8: https://...
+    #
+    # 汉化覆盖（可选，通用规则）：把要替换的文件放到 delta/assets/overwrite/<组件名>/ 下即生效 ——
+    #   目录名必须是上面 components 里的名字，目录内保持「相对安装目录」的结构，例如：
+    #     delta/assets/overwrite/ndm/NeatDM.exe                  → 覆盖 <安装目录>\NeatDM.exe
+    #     delta/assets/overwrite/ndm/Languages/zh-CN.ini          → 覆盖 <安装目录>\Languages\zh-CN.ini
+    #   构建期这些文件被打进 C:\Tools\install\ow_<组件名>\，首次开机装完该组件后由 unattend 里
+    #   追加的 copy 命令覆盖过去（纯文件复制，不需要任何脚本 / Python）。
+    #   覆盖目标 = 该组件的官方默认安装目录（目前已登记：ndm / 7zip / mpcbe），未登记的组件直接报错。
+    #   NDM 汉化成品来源需自行确认：exe 汉化必然破签名，无法验证完整性，故本仓库不内置该文件。
+    #   实测可用的成品：github.com/wmwlwmwl/NeatDM-CN 的 out/NeatDM.exe（对应官方 1.4.24）
 
 # ---- 预装应用：写一行装一个；注释 / 不写 = 不装 ----
-# 与上方 remove 同一套规则：**全局表对所有分支生效**，某分支专属/只该分支能装的写进
-# branches.<b>.apps，脚本合并去重。本文件没有「排除」语法 —— 全局写了就是所有分支都装，
-# 所以「Win10 装不了」的包必须写在 26100 分支下，不要放全局。
+# 与上方 remove 同一套规则：**全局表对所有分支生效**，某分支专属的写进 branches.<b>.apps，
+# 脚本合并去重。本文件没有「排除」语法 —— 全局写了就是所有分支都装，
+# 所以「只有 Win11 装得了」的包必须写在 26100 分支下，不要放全局。
 # 值的形态，脚本自动分流（不匹配任何形态即报错，不静默跳过）：
 #   Store 产品 ID（12 位字母数字） → 构建期换算成微软官方 CDN 直链后下载（含依赖框架）
 #   完整直链（含 ://）             → 直接下载
+# 选包规则（同一产品 ID 常返回多个候选）：
+#   架构优先 x64 / neutral（arm 系一律丢弃），再取包名里版本号最大的那个 —— 刻意不按体积排，
+#   体积排序会选中旧版（实测 Media Player 会选到 2019 年的包而非现行 11.2607.16.0）。
+#   加密包（.eappxbundle / .emsixbundle）无法离线预置，脚本按扩展名排除。
 # license：同名 .xml 放在对应载荷目录就带上；没有则 /SkipLicense。
 #          /SkipLicense 预置非 Store 来源的包时，必须同时启用 optimize 里的
 #          allow_all_trusted_apps，否则用户首次登录注册会失败、应用打不开。
 apps:
   # 全分支通用项写这里（示例：Terminal 支持 Win10 1809+，两支都能用）
   # - https://github.com/microsoft/terminal/releases/download/<版本>/Terminal.msixbundle
-
-# ---- 优化设置：写了就生效；注释 / 不写 = 不做 ----
-optimize:
-  # ===== 组 A｜上游 W10UI 开关（零新代码：99 把对应键置 1 写回上游 W10UI.ini）=====
-  - nosuggapp              # 禁第三方应用静默安装
-  - nosuggtip              # 禁「建议 / Spotlight / 锁屏聚焦 / 搜索框推荐」
-  - norestorage            # 关预留存储
-  - nogamebar              # 关 Xbox Game Bar
-  - oobebypass             # OOBE 免联网建本地账户
-  - UpdtBootFiles          # 更新 ISO 引导文件 + UEFI CA 2023 新安全启动证书（旧 CA 2026-06 已到期）
-
-  # ===== 组 B｜离线 hive 注入（构建期写进镜像，装完即生效；不用首启脚本）=====
-  # --- 电源与性能 ---
-  - disable_hibernate      # 关休眠      SYSTEM\ControlSet001\Control\Power\HibernateEnabled=0
-  - disable_faststartup    # 关快速启动  SYSTEM\ControlSet001\Session Manager\Power\HiberbootEnabled=0
-  # --- 隐私（Policies 路径 = 硬锁，用户改不回去）---
-  - disable_telemetry      # 关遥测      SOFTWARE\Policies\Microsoft\Windows\DataCollection\AllowTelemetry=0
-  - no_consumer_features   # 关消费者体验（自动推装应用 / 开始菜单推荐）
-  - no_spotlight           # 关 Windows 聚焦 / 锁屏推荐
-  - no_advertising_id      # 关广告 ID
-  - no_feedback            # 关反馈通知
-  # --- 界面（默认用户 hive = 软默认，用户可自己改回）---
-  - show_file_extensions   # 显示文件扩展名
-  - show_hidden_files      # 显示隐藏文件
-  - taskbar_align_left     # Win11 任务栏左对齐
-  - classic_context_menu   # Win11 经典右键菜单
-  - numlock_on             # 小键盘开机默认亮
-  # --- 安全与兼容 ---
-  - no_bitlocker_auto      # 禁 BitLocker 自动加密
-  - allow_all_trusted_apps # 允许预置非 Store 签名包（配合 apps 的 /SkipLicense，必须开）
-  # 说明：pagefile 不在此处 —— Windows 默认的「系统管理」就是"平时占用最少 + 不爆内存"的正解
 
 # ---- 上传：值 = 保留份数；注释 / 不写 = 不上传 ----
 storage:

@@ -51,6 +51,15 @@ try {
 if (-not $cfg.branches.$BranchId) { Log "FAIL config.json 里没有分支 $BranchId"; throw "预检失败: 分支未定义" }
 Log "config.json 就位（分支 $BranchId 已定义）"
 
+# optimize 段结构（执行器 07 / 99 直接消费它；结构不对会让那两步跑到一半才炸）
+foreach ($sub in 'ini','registry','components') {
+    if (-not $cfg.optimize.PSObject.Properties[$sub]) {
+        Log "FAIL config.json 的 optimize 缺子键 $sub（由 config-to-json.py 从 config.yml 拍平）"
+        throw "预检失败: optimize.$sub"
+    }
+}
+Log "optimize 就位（ini $(@($cfg.optimize.ini).Count) / registry $(@($cfg.optimize.registry).Count) / components $(@($cfg.optimize.components.PSObject.Properties.Name).Count)）"
+
 # 应答模板（单一文件，两分支共用）
 $un = Join-Path $WorkDir 'config\unattend.xml'
 if (-not (Test-Path $un)) { Log "FAIL 缺少应答模板: $un"; throw "预检失败: unattend.xml" }

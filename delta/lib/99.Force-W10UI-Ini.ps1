@@ -1,11 +1,13 @@
 ﻿<#
 .SYNOPSIS 99 - 把「上游 ini 开关」强制写进 W10UI.ini（在调用 W10UI.cmd 之前运行）
 .DESCRIPTION 两类值的唯一真相源：
-               1) delta\win10ui-override.ini      —— 不随配置变的红线（wim2esd=0 / ResetBase=0）
-               2) config.json 的 optimize_ini 列表 —— 组 A 项，写了就把该键置 1
+               1) delta\win10ui-override.ini            —— 不随配置变的红线（wim2esd=0 / ResetBase=0）
+               2) config.json 的 optimize.ini（由 config.yml 拍平）—— 写了就置 1
              只改这些键的值，不整文件覆盖上游 W10UI.ini，免疫上游后续加键。
-   [为何自补项不塞进 ini] W10UI.cmd 读 ini 有白名单，未知键会被静默忽略 ——
-          所以组 B 走 07.Bake-Image 的离线 hive 注入，组别由 tools/config-to-json.py 判好。
+  [本脚本只提供逻辑，不含任何具体开关] 开关名全部来自 config.yml 的 optimize.ini，
+           执行时逐个核对上游 ini 真有该键 —— 对不上就报错，绝不静默失效。
+  [为何自补项不塞进 ini] W10UI.cmd 读 ini 有白名单，未知键会被静默忽略 ——
+           所以上游没有的功能一律走 07.Bake-Image 的离线 hive 注入（optimize.registry）。
 #>
 [CmdletBinding()]
 param(
@@ -37,7 +39,7 @@ foreach ($line in ([IO.File]::ReadAllText($override) -split "`r?`n")) {
     }
 }
 
-# 2) 读上游 W10UI.ini（字节保真） + 组 A：config.json 的 optimize_ini 项 -> 置 1
+# 2) 读上游 W10UI.ini（字节保真） + config 写了的 optimize.ini 键 -> 置 1
 $latin1 = [Text.Encoding]::GetEncoding(28591)                               # 每个字节 -> 同一码位，往返零损失
 $iniText = $latin1.GetString([IO.File]::ReadAllBytes($ini))
 $nl = if ($iniText.Contains("`r`n")) { "`r`n" } else { "`n" }               # 沿用原文件换行符
@@ -52,15 +54,16 @@ $iniKeys = @($iniLines | ForEach-Object {
     $m = [regex]::Match($_, '^\s*([^;#][^=]+?)\s*=')
     if ($m.Success) { $m.Groups[1].Value.Trim() }
 })
-$groupA = @($cfg.optimize_ini)
+# 生效集合 = config.yml 的 optimize.ini（由 config-to-json.py 拍平；未写则为空）
+$groupA = @(@($cfg.optimize.ini) | Where-Object { $_ })
 # 上游一旦改名/删键，这里必须炸 —— 否则你以为开了、实际没开（静默失效最坏）
 $missing = @($groupA | Where-Object { $iniKeys -notcontains $_ })
 if ($missing.Count -gt 0) {
     Log "FAIL 上游 W10UI.ini 里没有这些键: $($missing -join ', ')"
-    throw "optimize 组 A 项在上游 ini 里不存在（上游可能改了键名，请核对 W10UI.ini）"
+    throw "optimize.ini 项在上游 ini 里不存在（上游可能改了键名，请核对 W10UI.ini）"
 }
 foreach ($name in $groupA) { $forces[$name] = '1' }
-Log "组 A 生效项: $(if ($groupA.Count) { $groupA -join ', ' } else { '无' })"
+Log "optimize.ini 生效 $(if ($groupA.Count) { $groupA -join ', ' } else { '无' })"
 
 # 3) 逐行改写：只覆盖命中键，其余原样，最后补 ini 里没有的键
 $handled = @{}

@@ -9,6 +9,9 @@ config.yml -> config.json
 顺带做结构性校验：把「配置写错」挡在构建之前（fail fast），而不是跑到一半才炸。
 每个键都必须有消费者 —— 这里校验的就是"消费者能不能正确理解它"。
 
+optimize 是唯一控制面板里唯一带结构的段（ini / registry / components 三个子键），
+本脚本负责把它按执行器需要拍平成 JSON —— pwsh 侧不解析 YAML，只读拍平后的结果。
+
 用法：python3 tools/config-to-json.py [config.yml] [config.json]
 退出码：0 通过；非 0 失败（GitHub Actions 会显示 ::error:: 注解）
 """
@@ -18,28 +21,141 @@ import re
 import sys
 
 # ---- 允许的顶层键（写了别的 = 死字段，直接报错） ----
-TOP_KEYS = {"baseline", "remove", "branches", "gvlk", "components", "apps", "optimize", "storage"}
-
-# ---- optimize 允许的项：漏一个就报错，防止"写了却没人执行" ----
-OPT_INI = {"nosuggapp", "nosuggtip", "norestorage", "nogamebar", "oobebypass", "UpdtBootFiles"}
-OPT_HIVE = {
-    # 电源与性能
-    "disable_hibernate", "disable_faststartup",
-    # 隐私（Policies 路径）
-    "disable_telemetry", "no_consumer_features", "no_spotlight", "no_advertising_id", "no_feedback",
-    # 界面（默认用户 hive）
-    "show_file_extensions", "show_hidden_files", "taskbar_align_left", "classic_context_menu", "numlock_on",
-    # 安全与兼容
-    "no_bitlocker_auto", "allow_all_trusted_apps",
-}
+TOP_KEYS = {"baseline", "remove", "branches", "gvlk", "optimize", "apps", "storage"}
 
 APP_ID_RE = re.compile(r"^[0-9A-Z]{12}$")          # Store 产品 ID
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+# components 可落地的形态 —— 与 07.Bake-Image 的落地分流必须完全一致
+COMP_EXT = {".exe", ".msi", ".7z", ".zip"}
+
+# ---- optimize 的三个子键（与执行器的分工必须完全一致） ----
+OPT_KEYS = {"ini", "registry", "components", "_extensions"}
+# ini 子键：值 = 一句话说明（纯注释，执行器统一置 1）
+# registry 子键：值 = "hive|path|name|type|value" 字符串，或这类字符串的列表
+# components 子键：值 = 安装器完整直链
+
+HIVE_NAMES = {"SYSTEM", "SOFTWARE", "DEFAULT"}     # 与 07 的 $HIVES 必须一致
+REG_TYPES = {"DWORD", "SZ", "EXPAND_SZ"}           # 写入时脚本自己拼 REG_ 前缀
+REG_SEP = "|"
+REG_FIELDS = 5                                     # hive|path|name|type|value
 
 
 def fail(msg):
     print("::error::" + msg)
     sys.exit(1)
+
+
+def parse_reg_value(val, where):
+    """把一条 "hive|path|name|type|value" 拆成字典；写坏即报错。"""
+    if not isinstance(val, str) or val.count(REG_SEP) < REG_FIELDS - 1:
+        fail(f"{where} 必须是 {REG_FIELDS} 段竖线分隔的字符串：hive|path|name|type|value，实际: {val!r}")
+    # value 段本身可能含竖线（值里写 | 是合法的），故只切前 4 个分隔符
+    parts = val.split(REG_SEP, REG_FIELDS - 1)
+    hive, path, name, rtype, value = parts
+    hive = hive.strip()
+    if hive not in HIVE_NAMES:
+        fail(f"{where} 的 hive 只能是 {'/'.join(sorted(HIVE_NAMES))}，实际: {hive!r}")
+    if not path.strip():
+        fail(f"{where} 的 path 不能为空")
+    rtype = rtype.strip()
+    if rtype not in REG_TYPES:
+        fail(f"{where} 的 type 只能是 {'/'.join(sorted(REG_TYPES))}，实际: {rtype!r}")
+    if rtype == "DWORD" and not value.strip().lstrip("-").isdigit():
+        fail(f"{where} 的 type 是 DWORD，value 必须是整数，实际: {value!r}")
+    # 拆解结果直接落成 JSON 对象 —— 执行器（07）只读对象，不再重复解析字符串（单一解析点）
+    return {"hive": hive, "path": path, "name": name, "type": rtype, "value": value}
+
+
+def norm_opt_list(v, where):
+    """optimize 子键的值 → 字符串列表（标量也接受，统一成列表）。"""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    if not isinstance(v, list):
+        fail(f"{where} 必须是字符串或字符串列表")
+    out = []
+    for it in v:
+        if not isinstance(it, str) or not it.strip():
+            fail(f"{where} 里的项必须是非空字符串，实际: {it!r}")
+        out.append(it)
+    return out
+
+
+def check_components(comp, where):
+    """components 子键：名字 -> 安装器直链（与 07 的分流规则必须一致）。"""
+    if comp is None:
+        return {}
+    if not isinstance(comp, dict):
+        fail(f"{where} 必须是映射（名字: 链接）")
+    out = {}
+    for k, v in comp.items():
+        w = f"{where}.{k}"
+        if v is None:
+            fail(f"{w} 有名字没链接 —— 不集成就别写这一行（注释掉即可）")
+        if "://" not in str(v):
+            fail(f"{w} 的值必须是完整直链: {v!r}")
+        tail = str(v).rsplit("/", 1)[-1].split("?", 1)[0]
+        ext = ("." + tail.rsplit(".", 1)[-1]).lower() if "." in tail else ""
+        if ext not in COMP_EXT:
+            fail(f"{w} 的扩展名无法分流（引擎支持 {'/'.join(sorted(COMP_EXT))}）: {v!r}")
+        out[k] = str(v).strip()
+    return out
+
+
+def parse_optimize(opt):
+    """optimize 段 → 执行器直接可用的拍平结构。"""
+    if opt is None:
+        opt = {}
+    if not isinstance(opt, dict):
+        fail("optimize 必须是映射（子键: ini / registry / components）")
+    unknown = set(opt) - OPT_KEYS
+    if unknown:
+        fail(f"optimize 含未知子键（无消费者，禁止留着）：{', '.join(sorted(unknown))}")
+
+    # ---- ini ----
+    ini_raw = opt.get("ini")
+    if ini_raw is not None and not isinstance(ini_raw, dict):
+        fail("optimize.ini 必须是映射（开关名: 一句话说明）")
+    ini = []
+    for k, v in (ini_raw or {}).items():
+        if not re.match(r"^[A-Za-z0-9_]+$", k):
+            fail(f"optimize.ini 的键名 {k!r} 不合法（只允许字母/数字/下划线）")
+        if not isinstance(v, str):
+            fail(f"optimize.ini.{k} 的值必须是字符串（一句话说明；取值由上游 ini 语义决定，统一置 1）")
+        ini.append(k)
+
+    # ---- registry ----
+    reg_raw = opt.get("registry")
+    if reg_raw is not None and not isinstance(reg_raw, dict):
+        fail("optimize.registry 必须是映射（开关名: 竖线格式写入串）")
+    ext = norm_opt_list(opt.get("_extensions"), "optimize._extensions")
+    registry = []
+    for k, v in (reg_raw or {}).items():
+        if not re.match(r"^[A-Za-z0-9_]+$", k):
+            fail(f"optimize.registry 的键名 {k!r} 不合法（只允许字母/数字/下划线）")
+        lines = norm_opt_list(v, f"optimize.registry.{k}")
+        if not lines:
+            fail(f"optimize.registry.{k} 是空的 —— 该开关没有可执行的写入")
+        puts = []
+        for i, line in enumerate(lines):
+            where = f"optimize.registry.{k}[{i}]" if len(lines) > 1 else f"optimize.registry.{k}"
+            put = parse_reg_value(line, where)
+            # 展开型：含 {ext} 的行要对 _extensions 各写一次 —— 清单为空就等于没写，必须拦
+            if "{ext}" in line and not ext:
+                fail(f"{where} 用了 {{ext}} 展开，但 optimize._extensions 是空的（没有取值清单）")
+            puts.append(put)
+        registry.append({"name": k, "puts": puts})
+    if ext and not any("{ext}" in ln for k, v in (reg_raw or {}).items()
+                       for ln in norm_opt_list(v, f"optimize.registry.{k}")):
+        fail("optimize._extensions 写了却没有寄存器项用到 {ext} —— 要么补上展开行，要么删掉这份清单")
+
+    # ---- components ----
+    comps = check_components(opt.get("components"), "optimize.components")
+
+    if not ini and not registry and not comps:
+        fail("optimize 段是空的（ini / registry / components 都没写）—— 不做就把整段注释掉")
+    return {"ini": ini, "registry": registry, "extensions": ext, "components": comps}
 
 
 def norm_list(v, where, keep_int=False):
@@ -179,16 +295,6 @@ def main():
         for n in norm_list((bv or {}).get("remove"), f"branches.{b}.remove"):
             rm_forms.setdefault(n, check_remove_name(n, f"branches.{b}.remove"))
 
-    # ---- components ----
-    comps = cfg.get("components")
-    if comps is not None and not isinstance(comps, dict):
-        fail("components 必须是映射（名字: 链接）")
-    for k, v in (comps or {}).items():
-        if v is None:
-            fail(f"components.{k} 有名字没链接 —— 不集成就别写这一行（注释掉即可）")
-        if "://" not in str(v):
-            fail(f"components.{k} 的值必须是完整直链: {v!r}")
-
     # ---- apps（全局 + 分支） ----
     app_forms = {}
     for v in norm_list(cfg.get("apps"), "apps"):
@@ -198,18 +304,9 @@ def main():
             app_forms.setdefault(v, check_app_value(v, f"branches.{b}.apps"))
 
     # ---- optimize ----
-    opt = norm_list(cfg.get("optimize"), "optimize")
-    if len(set(opt)) != len(opt):
-        dup = sorted({x for x in opt if opt.count(x) > 1})
-        fail(f"optimize 有重复项: {', '.join(dup)}")
-    ini_items, hive_items = [], []
-    for name in opt:
-        if name in OPT_INI:
-            ini_items.append(name)
-        elif name in OPT_HIVE:
-            hive_items.append(name)
-        else:
-            fail(f"optimize 里的 {name!r} 没有实现（既不是上游 ini 开关，也不是自有离线注入项）")
+    #   唯一带结构的段：ini / registry / components 三个子键，各由不同执行器消费。
+    #   本脚本负责按执行器需要把它拍平（pwsh 侧不解析 YAML，只读拍平结果）。
+    opt = parse_optimize(cfg.get("optimize"))
 
     # ---- storage ----
     st = cfg.get("storage") or {}
@@ -240,12 +337,8 @@ def main():
             for b, bv in branches.items()
         },
         "gvlk": {k: str(v).strip() for k, v in gvlk.items()},
-        "components": {k: str(v).strip() for k, v in (comps or {}).items()},
         "apps": norm_list(cfg.get("apps"), "apps"),
         "optimize": opt,
-        # 组别在解析这一处判好，下游按名取用即可（各自再维护一份名单必然漂移）
-        "optimize_ini": ini_items,      # 上游 W10UI.ini 开关 -> 99 写 ini（写了 = 置 1）
-        "optimize_hive": hive_items,    # 自有离线注入项 -> 07 写目标 hive
         "storage": uploads,
     }
     with io.open(dst, "w", encoding="utf-8", newline="\n") as f:
@@ -254,8 +347,9 @@ def main():
 
     print(f"OK  {src} -> {dst}")
     print(f"    镜像 {len(sources)} 条；分支 {len(branches)} 个；"
-          f"remove {len(rm_forms)} 项；components {len(out['components'])} 个；"
-          f"apps {len(app_forms)} 个；optimize {len(opt)} 项（ini {len(ini_items)} / hive {len(hive_items)}）；"
+          f"remove {len(rm_forms)} 项；apps {len(app_forms)} 个；"
+          f"优化 ini {len(opt['ini'])} 项 / registry {len(opt['registry'])} 项"
+          f"（展开清单 {len(opt['extensions'])} 个）/ components {len(opt['components'])} 个；"
           f"上传 {list(uploads) or '无'}")
     return 0
 
