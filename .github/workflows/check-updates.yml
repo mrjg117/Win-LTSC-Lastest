@@ -1,5 +1,25 @@
 ﻿name: Check Updates
 
+# 每日检测微软更新，有新版本就触发构建。
+#
+# 判据：去 Update Catalog 搜「<分支 detect 词> Cumulative Update」，取返回里**最新的那条
+#       累积更新**，与已有产物标签比较。
+#
+# 为什么不是「按 build 号搜」：
+#   * 按 build 号搜（如 "26100"）会把同 build 的 Server 版混进来（26100.33451），
+#     客户端真值却是 26100.9457 —— 取 max 直接误判。
+#   * Win10 的 Catalog 结果行 Version 列一律是 n/a，按 build 号根本取不到值。
+#   所以 detect 词填的是**产品名**（config.yml 里每分支必填），由标题认产品。
+#
+# 比较基准（同一行里能拿到什么就用什么，取最强信号）：
+#   * 标题里带 (build.UBR)（Win11 全系都带）→ 用 UBR 比标签 UBR，最精确；
+#     但要先确认这个 build 落在该分支 family 里，否则退回按日期比。
+#   * 标题里没有 build（Win10 全系都没有）→ 退回比发布日期。
+#   标签形如 <YYMMDD>-<UBR>-Win<10|11>，两个字段都在里面。
+#
+# 本工作流不改任何仓库文件（不写 patchlist、不 commit）——
+# 「当前构建到哪了」只由 Release 标签表达，不搞第二份真相源。
+
 on:
   schedule:
     # 每日 06:00 UTC，Patch Tuesday 当天也能及时捕获新累积更新
@@ -7,58 +27,143 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read     # 解析 config.yml / 列 Release
+  actions: write     # gh workflow run 需要
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        branch: ["19044", "26100"]
     steps:
       - uses: actions/checkout@v4
 
-      - name: 检测最新累积更新 UBR
-        id: detect
-        shell: pwsh
+      - name: 解析 config.yml -> config.json（含结构性校验）
         run: |
-          $branch = "${{ matrix.branch }}"
-          $pl = Get-Content patchlist.json | ConvertFrom-Json
-          $cur = $pl.branches.$branch.targetUBR
-          # [SPIKE] 检测源：Microsoft Update Catalog 搜索解析，或 UUPdump API。
-          #         HTML/API 结构需实机校准；解析失败则标记 warning 且不静默触发。
-          $q = [Uri]::EscapeDataString("$branch cumulative")
-          $latest = $null
-          try {
-            $html = Invoke-RestMethod "https://www.catalog.update.microsoft.com/Search.aspx?q=$q" -TimeoutSec 30
-            $m = [regex]::Matches($html, "$branch\.(\d+)")
-            $latest = ($m | ForEach-Object { [int]$_.Groups[1].Value } | Sort-Object -Descending | Select-Object -First 1)
-          } catch {
-            Write-Host "WARN 检测失败（不触发，等每日重试）: $_"
-          }
-          if (-not $latest) { echo "changed=false" >> $env:GITHUB_OUTPUT; break }
-          if ([int]$latest -le [int]$cur) { echo "changed=false" >> $env:GITHUB_OUTPUT; break }
-          echo "changed=true" >> $env:GITHUB_OUTPUT
-          echo "newubr=$latest" >> $env:GITHUB_OUTPUT
-          Write-Host "检测到新 UBR: $latest (当前 $cur)"
+          python3 -m pip install --quiet pyyaml
+          python3 tools/config-to-json.py config.yml config.json
 
-      - name: 更新 patchlist + 触发构建
-        if: steps.detect.outputs.changed == 'true'
-        shell: pwsh
+      - name: 检测是否有新累积更新
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NEWUBR: ${{ steps.detect.outputs.newubr }}
+          REPO: ${{ github.repository }}
         run: |
-          $branch = "${{ matrix.branch }}"
-          # 更新 targetUBR（[SPIKE] lcu.url/sha1 建议人工补或由 Catalog 详情页解析增强）
-          $pl = Get-Content patchlist.json | ConvertFrom-Json
-          $pl.branches.$branch.targetUBR = $env:NEWUBR
-          $pl | ConvertTo-Json -Depth 5 | Set-Content patchlist.json
-          git config user.email "bot@github.com"
-          git config user.name "update-bot"
-          git add patchlist.json
-          git commit -m "chore: bump $branch targetUBR -> $env:NEWUBR"
-          git push
-          # 触发 build（自动触发默认仅上传 Release；R2/OneDrive 由手动 dispatch 控制）
-          gh workflow run build_iso.yml --repo "${{ github.repository }}" -f branch=$branch
-          Write-Host "已触发 build_iso.yml (branch=$branch)"
+          set -euo pipefail
+          TAGS="$(gh release list --repo "$REPO" --limit 300 --json tagName --jq '.[].tagName' || true)"
+          export TAGS
+          python3 - <<'PY'
+          import io, json, os, re, urllib.parse, urllib.request
+          from datetime import date
+
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+          SEARCH = "https://www.catalog.update.microsoft.com/Search.aspx?q="
+
+          # 结果表每行 = <tr id="{GUID}_R{n}">…<td>…</td>×7…</tr>
+          # 列序：图标 | 标题 | Products | Classification | Last Updated | Version | Size | 下载按钮
+          ROW  = re.compile(r'<tr id="[0-9a-f\-]{36}_R\d+"[^>]*>(.*?)</tr>', re.S)
+          CELL = re.compile(r'<td[^>]*>(.*?)</td>', re.S)
+          TAG  = re.compile(r'<[^>]+>')
+          BUILD_IN_TITLE = re.compile(r'\((\d{4,6})\.(\d+)\)')     # Win11 标题尾巴的 (26100.9457)
+          MDY  = re.compile(r'^(\d{1,2})/(\d{1,2})/(\d{4})$')      # Last Updated 形如 9/14/2026
+
+          cfg  = json.load(io.open("config.json", encoding="utf-8"))
+          tags = [t.strip() for t in (os.environ.get("TAGS") or "").splitlines() if t.strip()]
+
+          def http(url):
+              req = urllib.request.Request(url, headers={"User-Agent": UA})
+              with urllib.request.urlopen(req, timeout=45) as r:
+                  return r.read().decode("utf-8", "replace")
+
+          def latest_lcu(detect):
+              """本产品最新一条「累积更新」（x64、正式版、非 .NET）→ dict 或 None。"""
+              url = SEARCH + urllib.parse.quote(detect + " Cumulative Update")
+              html = http(url)
+              best = None
+              for body in ROW.findall(html):
+                  c = [TAG.sub("", x).strip() for x in CELL.findall(body)]
+                  if len(c) < 7:
+                      continue
+                  title, products, dts = c[1], c[2], c[4]
+                  low = title.lower()
+                  if "cumulative update" not in low:          # 只要累积更新
+                      continue
+                  if "preview" in low:                        # 跳过可选预览版（非 Patch Tuesday）
+                      continue
+                  if ".net framework" in low or "dynamic cumulative" in low:
+                      continue
+                  if "x64-based systems" not in low:          # 只认 x64 架构
+                      continue
+                  m = MDY.match(dts)
+                  if not m:
+                      continue
+                  d = date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+                  if best is not None and d <= best["date"]:
+                      continue
+                  mkb = re.search(r"KB\d{6,7}", title)
+                  mb  = BUILD_IN_TITLE.search(title)
+                  best = {
+                      "title": title, "products": products, "class": c[3], "date": d,
+                      "kb": mkb.group(0) if mkb else "?",
+                      "build": int(mb.group(1)) if mb else None,
+                      "ubr":   int(mb.group(2)) if mb else None,
+                  }
+              return best
+
+          def have(edition):
+              """已有产物标签 -> (最高 UBR, 最新日期)。标签形如 260919-9457-Win11。"""
+              ubr, newest = 0, date(1970, 1, 1)
+              for t in tags:
+                  m = re.search(r"^(\d{6})-(\d+)-" + re.escape(edition) + r"$", t)
+                  if not m:
+                      continue
+                  ubr = max(ubr, int(m.group(2)))
+                  newest = max(newest, date(2000 + int(m.group(1)[:2]),
+                                            int(m.group(1)[2:4]), int(m.group(1)[4:6])))
+              return ubr, newest
+
+          need = []
+          for b, bv in cfg["branches"].items():
+              m = re.search(r"win\s*(\d+)", bv["label"], re.I)
+              if not m:
+                  print(f"::warning::分支 {b} 的 label 推不出 Win 版本号，跳过")
+                  continue
+              edition = "Win" + m.group(1)
+              cur_ubr, cur_date = have(edition)
+              try:
+                  new = latest_lcu(bv["detect"])
+              except Exception as e:                      # noqa: BLE001 - 网络/解析都可能失败
+                  print(f"::warning::分支 {b} 检测失败（不触发，等下次）: {e}")
+                  continue
+              if not new:
+                  print(f"::warning::分支 {b} 未从 Catalog 解析出累积更新（不触发）")
+                  continue
+              print(f"分支 {b}（{edition}  搜 {bv['detect']!r}）：")
+              print(f"  已有       UBR={cur_ubr}  日期={cur_date}")
+              print(f"  Catalog 最新 {new['kb']} "
+                    f"build={new['build']}.{new['ubr']}  日期={new['date']}  "
+                    f"class={new['class']!r}  products={new['products']!r}")
+              print(f"    {new['title']}")
+              # 标题带 build 且该 build 属于本分支 family -> 用 UBR（最精确）；否则退回比日期
+              if new["build"] is not None and new["build"] in bv["family"]:
+                  if new["ubr"] > cur_ubr:
+                      need.append(f"{b}(UBR {cur_ubr} -> {new['ubr']})")
+              elif new["date"] > cur_date:
+                  need.append(f"{b}({cur_date} -> {new['date']})")
+
+          if need:
+              print("::notice::检测到新版本，触发构建: " + ", ".join(need))
+              with io.open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+                  f.write("DO_BUILD=1\n")
+          else:
+              print("无新版本，跳过")
+          PY
+
+      - name: 触发 build_iso.yml
+        if: env.DO_BUILD == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 不传任何 input：build_iso.yml 没有 branch 参数，构建哪些分支由 config.yml 的
+          # baseline.sources 决定（旧版这里传 -f branch= 是幻觉参数，必失败）
+          gh workflow run build_iso.yml --repo "${{ github.repository }}"
+          echo "已触发 build_iso.yml（全部已声明分支）"

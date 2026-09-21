@@ -1,8 +1,14 @@
 ﻿name: Build ISO
 
-# 构建对象与份数完全由 config.yml 的 baseline.sources 决定（本文件不重复任何地址/哈希）。
-#   plan 任务解析清单 -> 输出矩阵 -> build 任务按矩阵并行构建。
-#   清单加一条（且该分支在 patchlist.json 有定义），产物就会自动多一份。
+# 构建对象与份数完全由 config.yml 决定（本文件不重复任何地址/哈希/分支信息）。
+#   plan 任务：config.yml -> config.json（唯一控制面板只解析一次；顺带做结构性校验），
+#              再据此输出矩阵；config.json 以 artifact 传给 build 任务 ——
+#              Windows 侧只读 JSON，不用装 YAML 解析库。
+#   build 任务：按矩阵并行构建。清单加一条（且该分支在 branches 里有定义）产物就多一份。
+#
+# 上游地址是本文件里唯一的 URL 常量：Win_ISO_Patching_Scripts 是**不可替换的唯一依赖**
+# （delta 全部挂在它产出的 install.wim 上），所以不适合放进「可随意改」的控制面板误导人。
+# 不钉 ref：持续吃上游最新；实际 commit 写进 Release notes 备查。
 
 on:
   workflow_dispatch:
@@ -41,62 +47,49 @@ permissions:
   contents: write
 
 jobs:
-  # 份数真相源 = config.yml 的 baseline.sources（一行一条）。此任务只解析清单 + 关联 patchlist 分支。
+  # 份数真相源 = config.yml 的 baseline.sources（一行一条）；分支定义在同一文件的 branches。
   plan:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.p.outputs.matrix }}
     steps:
-      - name: Checkout（config.yml + patchlist.json）
+      - name: Checkout（config.yml + tools/）
         uses: actions/checkout@v4
 
-      - name: 解析 baseline.sources -> 构建矩阵
-        id: p
-        shell: bash
+      - name: 解析 config.yml -> config.json（唯一控制面板只解析一次，顺带结构性校验）
         run: |
-          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 tools/config-to-json.py config.yml config.json
 
-          # 解析 config.yml 的 baseline.sources -> TSV：branch<TAB>url<TAB>sha256
-          # （文件名取 URL 末段 = 微软原版名；分片名/merge.cmd 键/成品名都从它派生）
-          ROWS="$(awk '
-            /^[a-zA-Z]/ { inb = ($1 == "baseline:") }
-            inb && /- branch:/ { if (b != "") print b "\t" u "\t" s; b = $3; u = ""; s = "" }
-            inb && /^[[:space:]]+url:/    { u = $2 }
-            inb && /^[[:space:]]+sha256:/ { s = $2 }
-            END { if (b != "") print b "\t" u "\t" s }
-          ' config.yml)"
-          if [ -z "$ROWS" ]; then
-            echo "::error::config.yml 的 baseline.sources 为空或无法解析"
-            exit 1
-          fi
+      - name: 生成构建矩阵
+        id: p
+        run: |
+          python3 - "$GITHUB_OUTPUT" <<'PY'
+          import json, re, sys
+          out = sys.argv[1]
+          cfg = json.load(open("config.json", encoding="utf-8"))
+          rows = []
+          for s in cfg["baseline"]["sources"]:
+              b   = s["branch"]
+              ver = re.search(r"win\s*(\d+)", cfg["branches"][b]["label"], re.I).group(1)
+              rows.append({
+                  "branch":  b,
+                  "edition": "Win" + ver,                     # 产物标签后缀的唯一生成点
+                  "iso":     s["url"].rsplit("/", 1)[-1],     # 文件名 = URL 末段（契约命名）
+                  "sha256":  s["sha256"].upper(),
+              })
+          m = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+          print("构建矩阵: " + m)
+          with open(out, "a", encoding="utf-8") as f:
+              f.write("matrix=" + m + "\n")
+          PY
 
-          MATRIX="["
-          SEP=""
-          while IFS=$'\t' read -r BR URL SHA; do
-            [ -z "$URL" ] && continue
-            BR="$(printf '%s' "$BR" | tr -d '"')"
-            URL="$(printf '%s' "$URL" | tr -d '"')"
-            SHA="$(printf '%s' "$SHA" | tr -d '"' | tr 'a-f' 'A-F')"
-            ISO="$(basename "$URL")"
-            # 该分支必须在 patchlist.json 有定义（构建引擎按分支取 build/sku/lean）
-            LABEL="$(python3 -c "import json,sys;d=json.load(open('patchlist.json',encoding='utf-8-sig'));print(d.get('branches',{}).get(sys.argv[1],{}).get('label',''))" "$BR")"
-            if [ -z "$LABEL" ]; then
-              echo "::warning::baseline.sources 的分支 $BR 在 patchlist.json 无定义，已跳过（要构建请先补分支定义）"
-              continue
-            fi
-            VER="$(printf '%s' "$LABEL" | grep -oiP 'win\K[0-9]+' | head -1)"
-            EDITION="Win${VER}"
-            MATRIX="${MATRIX}${SEP}{\"branch\":\"${BR}\",\"edition\":\"${EDITION}\",\"iso\":\"${ISO}\",\"sha256\":\"${SHA}\"}"
-            SEP=","
-          done <<< "$ROWS"
-          MATRIX="${MATRIX}]"
-
-          if [ "$MATRIX" = "[]" ]; then
-            echo "::error::没有任何可构建项（清单里的分支都没有 patchlist.json 定义）"
-            exit 1
-          fi
-          echo "构建矩阵: $MATRIX"
-          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+      - name: 上传 config.json（供 build 任务读取）
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-json
+          path: config.json
+          retention-days: 1
 
   build:
     needs: plan
@@ -118,28 +111,46 @@ jobs:
       KEEP_ONEDRIVE: ${{ (github.event_name == 'workflow_dispatch' && inputs.keep_onedrive) || (github.event_name == 'repository_dispatch' && github.event.client_payload.keep_onedrive) || 2 }}
 
     steps:
-      - name: Checkout 本仓库（delta + 配置 + 工作流）
+      - name: Checkout 本仓库（delta + 配置 + tools）
         uses: actions/checkout@v4
         with:
+          path: self
+
+      - name: 准备 Python（抓取载荷用）
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 取回 config.json（plan 任务产出；Linux 侧已解析并校验过）
+        uses: actions/download-artifact@v4
+        with:
+          name: config-json
           path: self
 
       - name: 拉上游最新 master（只读，不写）
         shell: bash
         run: |
-          git clone --depth 1 https://github.com/adavak/Win_ISO_Patching_Scripts.git src
+          # 唯一上游依赖，不可替换：delta 全部挂在它产出的 install.wim 上。
+          # 不钉 ref —— 持续吃上游最新；实际 commit 记进 Release notes。
+          UPSTREAM_URL="https://github.com/adavak/Win_ISO_Patching_Scripts.git"
+          git clone --depth 1 "$UPSTREAM_URL" src
           echo "UPSTREAM_COMMIT=$(cd src && git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: 套 delta 到上游快照（删 update-meta4.yml）
         shell: bash
         run: |
           cp -r self/delta/* src/
-          # 根级配置文件也要进 src：delta/lib/*.ps1 是按 $WorkDir(=src) 读取的
-          cp -f self/patchlist.json src/patchlist.json || true
-          cp -f self/config.yml src/config.yml || true
-          cp -f self/merge.cmd src/merge.cmd || true
+          # 根级配置要进 src：delta/lib/*.ps1 都是按 -WorkDir(=%cd%=src) 读取的
+          cp -f self/config.json src/config.json
           rm -f src/.github/workflows/update-meta4.yml || true
           echo "--- src 顶层文件 ---"
           ls -1 src/
+
+      - name: 抓取载荷（按 config 声明的 components + apps）
+        shell: bash
+        run: |
+          # 载荷落进 src/assets/{redist,apps}，正是 delta 脚本读取的位置
+          python self/tools/fetch-payloads.py --config self/config.json --dest src --branch "${{ matrix.branch }}"
 
       - name: cron 去重（仅每月兜底，本月已构建则跳过）
         if: github.event_name == 'schedule'
@@ -291,7 +302,7 @@ jobs:
           $expected = [math]::Ceiling($size / $chunk)
           if ($count -ne $expected) { throw "片数校验失败：期望 $expected 片，实际 $count 片" }
           # 生成 merge.cmd（内嵌本 ISO 期望哈希）并上传
-          $tpl = Get-Content self/merge.cmd -Raw
+          $tpl = Get-Content self/assets/release/merge.cmd -Raw
           $expLine = 'set "EXP_' + $isoBase + '.iso=' + $hash.ToUpper() + '"'
           $tpl = $tpl -replace '(?s)(REM ===EXPECTED_HASHES_START===).*?(REM ===EXPECTED_HASHES_END===)', ('$1' + [Environment]::NewLine + $expLine + [Environment]::NewLine + '$2')
           Set-Content -Path "out/merge.cmd" -Value $tpl -NoNewline

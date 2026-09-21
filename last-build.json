@@ -1,8 +1,0 @@
-﻿{
-  "schema": 1,
-  "note": "构建成功时由 build_iso.yml 末尾写回（含日期与 UBR）。check-updates.yml 的每月兜底 cron 运行前读取本文件，若本月已成功构建则跳过，避免与事件驱动重复。初始占位为 null。",
-  "branches": {
-    "19044": { "lastBuildDate": null, "lastUBR": null },
-    "26100": { "lastBuildDate": null, "lastUBR": null }
-  }
-}

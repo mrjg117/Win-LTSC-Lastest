@@ -1,7 +1,7 @@
 ﻿@echo off
 REM ============================================================================
 REM Patch.cmd - 总入口（管理员权限 + 编排 A→B→W10UI→E→D）
-REM   构建时本文件与 lib/*.ps1、assets、postsetup、config 已整目录拷进上游快照 ./src
+REM   构建时本文件与 lib/*.ps1、assets、config 已整目录拷进上游快照 ./src
 REM   调用：Patch.cmd <branchId>   例：Patch.cmd 26100
 REM   [SPIKE] W10UI.cmd 的输入/输出约定、本地补丁目录衔接需实机校准（见各步骤注释）
 REM ============================================================================
@@ -65,16 +65,11 @@ REM 01 已识别完 build/arch，baseline ISO（~5GB）与其解出的 install.w
 del /f /q "baseline-%BRANCH%.iso" >> "%LOG%" 2>&1
 if exist "iso-extract" rmdir /s /q "iso-extract"
 
-REM ---- 02 下载补丁（改造B） ----
+REM ---- 02 下载补丁到 patch\（上游 meta4 / Metalink） ----
+REM W10UI.cmd 自身不下载更新，只集成 Repo(=%cd%\patch) 下已有的补丁；
+REM patch\ 为空则 cmd_repo=0，等于没打补丁，故此步是必需环节。
 echo [%date% %time%] [02] Fetch-Updates >> "%LOG%"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\02.Fetch-Updates.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
-if errorlevel 1 goto :fail
-
-REM ---- 02b 用上游 meta4(Metalink) 下载补丁到 patch\ ----
-REM W10UI.cmd 自身不下载更新，只集成 Repo(=%cd%\patch) 下已有的补丁；
-REM patch\ 为空则 cmd_repo=0，等于没打补丁。此步照抄上游 Start.cmd 的 [4/4]。
-echo [%date% %time%] [02b] Fetch-Updates-Meta4 >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\02b.Fetch-Updates-Meta4.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 REM ---- 上游 W10UI.cmd 集成补丁到 install.wim ----
@@ -89,39 +84,29 @@ REM 2) patch\ 里的补丁包已集成进 install.wim，不再需要
 del /f /q *.iso >> "%LOG%" 2>&1
 if exist "patch" rmdir /s /q "patch"
 
-REM ---- 03 VC++ 注入（扩展E） ----
-echo [%date% %time%] [03] Integrate-VCpp >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\03.Integrate-VCpp.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+REM ---- 03 驱动注入 ----
+echo [%date% %time%] [03] Integrate-Drivers >> "%LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\03.Integrate-Drivers.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
-REM ---- 04 驱动注入 ----
-echo [%date% %time%] [04] Integrate-Drivers >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\04.Integrate-Drivers.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+REM ---- 04 应用预置（按 config.yml 的 apps 清单） ----
+echo [%date% %time%] [04] Integrate-Apps >> "%LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\04.Integrate-Apps.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
-REM ---- 05 应用预装（仅 Win11） ----
-echo [%date% %time%] [05] Integrate-Apps >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\05.Integrate-Apps.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+REM ---- 05 组件精简（按 config.yml 的 remove 清单） ----
+echo [%date% %time%] [05] Patch-Components >> "%LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\05.Patch-Components.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
-REM ---- 06 组件精简 ----
-echo [%date% %time%] [06] Patch-Components >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\06.Patch-Components.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+REM ---- 06 断言（失败即中止，不留半成品） ----
+echo [%date% %time%] [06] Assert-UBR >> "%LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\06.Assert-UBR.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
-REM ---- 07 断言（改造D，失败即中止，不留半成品） ----
-echo [%date% %time%] [07] Assert-UBR >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\07.Assert-UBR.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
-if errorlevel 1 goto :fail
-
-REM ---- 09 生成 postsetup.settings.json（读 config.yml；08 会把它烤入 C:\PostSetup） ----
-echo [%date% %time%] [09] Gen-PostSetup >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\09.Gen-PostSetup.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
-if errorlevel 1 goto :fail
-
-REM ---- 08 烤入自动应答 + PostSetup ----
-echo [%date% %time%] [08] Bake-Image >> "%LOG%"
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\08.Bake-Image.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
+REM ---- 07 烤入镜像（SKU 转 IoT + 离线优化注入 + 应答 + C:\Tools） ----
+echo [%date% %time%] [07] Bake-Image >> "%LOG%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\07.Bake-Image.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%" >> "%LOG%" 2>&1
 if errorlevel 1 goto :fail
 
 REM ---- 封装最终 ISO ----

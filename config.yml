@@ -1,28 +1,21 @@
 ﻿# =============================================================================
-# Win-LTSC 统一配置 —— 唯一控制面板
-# 规则：全局开关/列表都写在这一个文件里；脚本只读它，别去改脚本。
-#       只有"真实二进制素材"(驱动.inf、MAS脚本、应答模板)才放文件夹。
-# 说明：
-#   - 本文件控制：上游、baseline、全局组件/应用/驱动开关、postsetup(首启脚本)、
-#     三端存储、触发策略。
-#   - 每分支的"构建目标"(targetUBR / LCU / SSU / 组件精简清单)在 patchlist.json，
-#     由构建引擎读取（差异化、按月更新），不要搬到这里以免两份真相源。
+# Win-LTSC 唯一控制面板
+# -----------------------------------------------------------------------------
+# 全文统一规则：写了 = 启用；注释掉 / 不写 = 停用。
+#               没有 false，没有 KEEP，没有 remove_*/keep_* 成对开关。
+# 只有「真实二进制素材」（驱动 .inf、应答模板、license.xml、MAS 工具包）才放文件夹。
+# 地址与哈希的唯一真相源就是本文件 —— 脚本/工作流不重复写。
 # =============================================================================
 
-upstream:
-  repo: adavak/Win_ISO_Patching_Scripts
-  ref: master
-
-# ---- 源镜像：下载地址 + SHA256 的唯一真相源（别处不再重复写） ----
+# ---- 源镜像：一行一条，产物份数 = 条数 ----
 baseline:
   chunk_mib: 1900                     # 每片上限(MiB)，留余量避开 GitHub 2GB 资产上限
-  threads: 16                         # 下载并发连接数（aria2 -x/-s）。嫌慢改 32 即可，别处不用动。
-  # sources：一行一条镜像。规则——
-  #   * 文件名 = URL 末段（就是微软原版名，契约命名）。分片名 <名>.partN、merge.cmd 里的
-  #     EXP_<名> 键、成品 ISO 名，全部由它派生 —— 所以 URL 末段必须就是最终要的名字。
-  #   * url    = 完整下载地址（HTTP/HTTPS）。各源域名可不同，逐条完整写，不做拼接。
-  #   * sha256 = 落地后强校验；不符即失败，不会把坏字节切片上传。
-  #   * 产物构建份数 = 本清单条数：加一条即多产一份（该分支须在 patchlist.json 有定义）。
+  threads: 16                         # 下载并发连接数（aria2 -x/-s）。嫌慢改 32，别处不用动。
+  # sources 规则：
+  #   * 文件名 = URL 末段（就是微软原版名，即契约命名）。分片名 <名>.partN、merge.cmd 的
+  #     EXP_<名> 键、成品 ISO 名全部由它派生 —— URL 末段必须就是最终要的名字。
+  #   * url    = 完整下载地址，逐条完整写，不做拼接（各源域名可不同）。
+  #   * sha256 = 落地后强校验，不符即失败（不会把坏字节切片上传）。
   sources:
     - branch: "26100"
       url: https://download.testip.xyz/windows/zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso
@@ -31,68 +24,124 @@ baseline:
       url: https://download.testip.xyz/windows/zh-cn_windows_10_enterprise_ltsc_2021_x64_dvd_033b7312.iso
       sha256: C117C5DDBC51F315C739F9321D4907FA50090BA7B48E7E9A2D173D49EF2F73A3
 
-# ---- 组件精简：倾向开关（具体包名清单在 patchlist.json 每分支的 lean） ----
-lean:
-  enabled: true
-  remove_xps: true
-  remove_wmp_legacy: true
-  keep_internet_printing: true       # 你说留着
-  keep_workfolders: true             # 你说留着
-  remove_ie11_win10: false           # Win10 因 Edge IE 模式依赖 MSHTML，KEEP
-  keep_rds_collaboration: true       # IoT 可移除包，为安全 KEEP（远程桌面家族）
-  iot_deep_cleanup: true             # IoT Removable Packages 深度精简（仅 IoT SKU）
+# ---- 组件精简：写了就卸，注释掉 / 不写 = 保留 ----
+# 这一张表对**所有分支**生效。某分支要多卸几项，写进 branches.<b>.remove，脚本合并去重。
+# 名字形态由脚本自动分流；不匹配任何形态即报错退出（不静默跳过）：
+#   含 ~~~~          → 按 Capability 卸载（如 XPS.Viewer~~~~0.0.1.0）
+#   以 -Package 结尾  → 按 Package 卸载
+#   其余             → 按 Optional Feature 关闭
+remove:
+  # 能力
+  - XPS.Viewer~~~~0.0.1.0
+  - App.StepsRecorder~~~~0.0.1.0
+  - QuickAssist~~~~0.0.1.0
+  # 包
+  - Microsoft-Windows-CameraBarcodeScanner-Package
+  - Microsoft-Windows-USBFunction-Package
+  - Microsoft-Windows-NetworkMobileHandlers-Package
+  - Microsoft-Windows-DesktopFileExplorer-Package
+  - Microsoft-Windows-UEV-Package
+  - Microsoft-Windows-LegacyWordbreaker-Package
+  - Microsoft-Windows-BootEnvironment-Dvd-Package
+  - Microsoft-Windows-3DAudio-HRTFData-Package
 
-# ---- 组件集成：写啥自动下载+集成，不限于 VC；列表项=已知别名或显式 url ----
+# ---- 每分支构建目标 ----
+branches:
+  "26100":
+    label: Win11-LTSC-2024            # → 产物标签 <YYMMDD>-<UBR>-Win11
+    edition: IoTEnterpriseS           # 构建时 Dism /Set-Edition 到此 SKU（密钥查下方 gvlk 表）
+    family: [26100, 26200, 26300]     # 允许的 build 家族（上游可能装"版本启用包"，build 会跳）
+    # detect：check-updates 用它去 Update Catalog 搜「微软为本产品最新发了什么」。
+    #   刻意用产品名而不是 build 号 —— 按 build 号搜会把 Server 版同名 build 混进来
+    #   （实测 26100 那页里 Server 是 26100.33451，真客户端是 26100.9457）。
+    detect: Windows 11, version 24H2
+    remove:                           # 本分支额外卸（与上方全局 remove 合并）
+      - Media.Playback~~~~0.0.1.0
+    apps:                             # 本分支应用（与上方全局 apps 合并去重）
+      - 9WZDNCRFJBMP                  # Microsoft Store（LTSC 出厂不带）
+      - 9PCFS5B6T72H                  # 画图 Paint
+      - 9MSMLRH6LZF3                  # 记事本 Windows Notepad
+      - 9WZDNCRFJ3PT                  # 媒体播放器 Windows Media Player
+      # 以上为 Win11 版本线的包；同一产品 ID 在官方接口下按目标 OS 返回不同 PackageSet，
+      # Win10 分支要用它自己那条线（见下方 19044）。
+  "19044":
+    label: Win10-LTSC-2021
+    edition: IoTEnterpriseS
+    family: [19041, 19042, 19043, 19044, 19045]
+    # detect：同上。Win10 的 Catalog 结果里没有 build 号（Version 列是 n/a），
+    #   所以只能按产品名认，比较"最新一次的发布日期"而不是 build 号。
+    detect: Windows 10 Version 21H2
+    remove:
+      - MicrosoftWindowsPowerShellV2
+      - MicrosoftWindowsPowerShellV2Root
+    # Win10 分支的应用写在下面（与全局 apps 合并去重）。注意：
+    #   新版 MSIX 的 MinVersion 钉 Windows 11，强注报 0x80073cfd；
+    #   要装就用 Win10 版本线的包（同一产品 ID 在官方接口下另有 Windows 10 的 PackageSet），
+    #   或改用直链。留空 = 本分支不预装任何应用。
+    # apps:
+    #   - 9WZDNCRFJBMP                # 例：Store（须为 Win10 线包，落地前先实体实测）
+
+# ---- SKU 转换用的 KMS GVLK（微软官方文档所列，一般不用改）----
+gvlk:
+  IoTEnterpriseS: KBN8V-HFGQ4-MGXVD-347P6-PDQGT   # Windows IoT Enterprise LTSC 2024 / 2021 通用
+  EnterpriseS:    M7XTQ-FN8P6-TTKYV-9D4CC-J462D   # Windows 11 / 10 Enterprise LTSC（备用）
+
+# ---- 集成组件：名字: 链接。写了 = 构建期下载并烤进 C:\Tools\redist（附一键安装入口）；注释 / 不写 = 不做 ----
+# 说明：DISM /Add-Package 只接受 .cab/.msu，而 VC++ 可再发行包是 MSI/exe —— 官方口径明确
+#       不能这样离线集成，唯一官方途径是部署后静默安装（/install /quiet /norestart）。
+#       所以这里是「下载 → 烤进 C:\Tools\redist → 生成 C:\Tools\安装运行库.cmd」，不注入镜像组件存储。
 components:
-  redist:                             # Visual C++ 可再发行版(自动下载微软官方包)
-    - vc14_x64
-    - vc14_x86
-  dotnet_runtime: false              # true 时填版本号，脚本去官方拉
-  webview2: false
-  directx: false
-  powershell7: false
+  vc14_x64: https://aka.ms/vs/17/release/vc_redist.x64.exe
+  vc14_x86: https://aka.ms/vs/17/release/vc_redist.x86.exe
+  # dotnet8: https://...
 
-# ---- 应用预装：写任意 Microsoft Store 包族名(PackageFamilyName)即集成 ----
+# ---- 预装应用：写一行装一个；注释 / 不写 = 不装 ----
+# 与上方 remove 同一套规则：**全局表对所有分支生效**，某分支专属/只该分支能装的写进
+# branches.<b>.apps，脚本合并去重。本文件没有「排除」语法 —— 全局写了就是所有分支都装，
+# 所以「Win10 装不了」的包必须写在 26100 分支下，不要放全局。
+# 值的形态，脚本自动分流（不匹配任何形态即报错，不静默跳过）：
+#   Store 产品 ID（12 位字母数字） → 构建期换算成微软官方 CDN 直链后下载（含依赖框架）
+#   完整直链（含 ://）             → 直接下载
+# license：同名 .xml 放在对应载荷目录就带上；没有则 /SkipLicense。
+#          /SkipLicense 预置非 Store 来源的包时，必须同时启用 optimize 里的
+#          allow_all_trusted_apps，否则用户首次登录注册会失败、应用打不开。
 apps:
-  store: true                        # 恢复 Microsoft Store
-  paint: true                        # 画图
-  notepad: true                      # 新记事本
-  mediaplayer: true                  # 媒体播放器
-  nanazip: false
-  # 自定义：直接写包族名即可，例如：
-  # - Microsoft.WindowsTerminal_8wekyb3d8bbwe
-  # - Microsoft.PowerToys_8wekyb3d8bbwe
+  # 全分支通用项写这里（示例：Terminal 支持 Win10 1809+，两支都能用）
+  # - https://github.com/microsoft/terminal/releases/download/<版本>/Terminal.msixbundle
 
-# ---- 驱动注入：开关 + 真实文件放 assets/drivers/ ----
-drivers:
-  inject: true                       # assets/drivers/*.inf -> install.wim(全量池)
-  boot_minimal: true                 # assets/drivers/boot/*.inf -> boot.wim(最小集)
+# ---- 优化设置：写了就生效；注释 / 不写 = 不做 ----
+optimize:
+  # ===== 组 A｜上游 W10UI 开关（零新代码：99 把对应键置 1 写回上游 W10UI.ini）=====
+  - nosuggapp              # 禁第三方应用静默安装
+  - nosuggtip              # 禁「建议 / Spotlight / 锁屏聚焦 / 搜索框推荐」
+  - norestorage            # 关预留存储
+  - nogamebar              # 关 Xbox Game Bar
+  - oobebypass             # OOBE 免联网建本地账户
+  - UpdtBootFiles          # 更新 ISO 引导文件 + UEFI CA 2023 新安全启动证书（旧 CA 2026-06 已到期）
 
-# ---- 首启脚本：每个都是 on/off 开关，调它别改脚本 ----
-postsetup:
-  mas: false                         # true=烤入并运行 MAS 激活(脚本放 delta/postsetup/mas/)
-  disable_hibernate: true            # true=关闭休眠(powercfg -h off)
-  disable_reserved_storage: false    # true=关闭预留空间(dism /Set-ReservedStorageState /Disabled)
-  pagefile:
-    mode: none                       # none(系统默认) | system_managed | fixed
-    fixed_mb: 4096                   # mode=fixed 时生效
-  wsreset: false                     # true=首启跑 wsreset -i 重注册 Store(需在线+网络)
-  clean_after_run: false             # true=Run-All.ps1 跑完自清 C:\PostSetup
+  # ===== 组 B｜离线 hive 注入（构建期写进镜像，装完即生效；不用首启脚本）=====
+  # --- 电源与性能 ---
+  - disable_hibernate      # 关休眠      SYSTEM\ControlSet001\Control\Power\HibernateEnabled=0
+  - disable_faststartup    # 关快速启动  SYSTEM\ControlSet001\Session Manager\Power\HiberbootEnabled=0
+  # --- 隐私（Policies 路径 = 硬锁，用户改不回去）---
+  - disable_telemetry      # 关遥测      SOFTWARE\Policies\Microsoft\Windows\DataCollection\AllowTelemetry=0
+  - no_consumer_features   # 关消费者体验（自动推装应用 / 开始菜单推荐）
+  - no_spotlight           # 关 Windows 聚焦 / 锁屏推荐
+  - no_advertising_id      # 关广告 ID
+  - no_feedback            # 关反馈通知
+  # --- 界面（默认用户 hive = 软默认，用户可自己改回）---
+  - show_file_extensions   # 显示文件扩展名
+  - show_hidden_files      # 显示隐藏文件
+  - taskbar_align_left     # Win11 任务栏左对齐
+  - classic_context_menu   # Win11 经典右键菜单
+  - numlock_on             # 小键盘开机默认亮
+  # --- 安全与兼容 ---
+  - no_bitlocker_auto      # 禁 BitLocker 自动加密
+  - allow_all_trusted_apps # 允许预置非 Store 签名包（配合 apps 的 /SkipLicense，必须开）
+  # 说明：pagefile 不在此处 —— Windows 默认的「系统管理」就是"平时占用最少 + 不爆内存"的正解
 
-# ---- 产物上传 + 保留策略 ----
+# ---- 上传：值 = 保留份数；注释 / 不写 = 不上传 ----
 storage:
-  release:
-    enabled: true
-    keep: 3                          # 保留最近 3 个同分支/同系统 Release
-  r2:
-    enabled: false
-    keep: 1
-    bucket: ""                       # 填 R2 桶名(凭证走 Secrets)
-  onedrive:
-    enabled: false
-    keep: 2
-
-# ---- 自动检测更新 ----
-trigger:
-  schedule: "0 6 * * *"              # 每日 06:00 UTC
-  only_important: false              # true=仅重要(质量/月度)更新才触发构建
+  release: 3
+  # r2: 1
+  # onedrive: 2

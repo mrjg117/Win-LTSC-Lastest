@@ -1,6 +1,10 @@
 # WorkBuddy 内部数据（记忆/自动化/skills），非项目源码，不入库
 .workbuddy/
 
+# Python 字节码残留
+__pycache__/
+*.pyc
+
 # 本地测试/侦察残留
 _recon.txt
 test-*.log
@@ -16,3 +20,10 @@ gitcfg.txt
 updates/
 logs/
 scratch/
+
+# 构建期生成物（Linux 侧由 config.yml 转出；载荷由 tools/fetch-payloads.py 抓来）
+config.json
+delta/assets/apps/*/
+delta/assets/apps/apps-manifest.json
+delta/assets/redist/*
+!delta/assets/redist/.gitkeep

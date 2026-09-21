@@ -1,4 +1,18 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  应答模板（两分支共用）—— 由 07.Bake-Image.ps1 烤进 C:\Windows\Panther\unattend.xml
+
+  只做三件事：区域/输入法、时区与计算机名、OOBE 减负。
+
+  [边界] Panther\unattend.xml 只对 specialize / oobeSystem 阶段生效。
+         windowsPE 段（选版本 / 跳密钥 / 分区）放这里是死的 —— 那需要 ISO 根的
+         \autounattend.xml，而它只在「从 ISO 引导标准安装」时有效，WinNTSetup 不读。
+  [不做] 不建账户、不自动登录、不跳「用户 OOBE」—— 本镜像不预建账户，跳过去只会
+         停在没有账户的登录页。账户留给装机的人自己建；要免联网建本地账户，
+         用 optimize 里的 oobebypass（写 OOBE\BypassNRO 注册表值）。
+  [统一] 原两份模板（26100 / 19044）的差异项已收拢为一份：双方共有的保留，
+         只有一个分支有的按上面 [不做] 的理由去掉 —— 不再维护两份必然漂移的副本。
+-->
 <unattend xmlns="urn:schemas-microsoft-com:unattend">
   <settings pass="specialize">
     <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
@@ -20,13 +34,6 @@
         <ProtectYourPC>3</ProtectYourPC>
         <NetworkLocation>Work</NetworkLocation>
       </OOBE>
-      <FirstLogonCommands>
-        <SynchronousCommand wcm:action="add">
-          <Order>1</Order>
-          <CommandLine>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\PostSetup\Run-All.ps1</CommandLine>
-          <Description>首启兜底执行 PostSetup 脚本</Description>
-        </SynchronousCommand>
-      </FirstLogonCommands>
     </component>
   </settings>
 </unattend>

@@ -1,6 +1,7 @@
 ﻿<#
 .SYNOPSIS 00 - 预检 fail-fast
-.DESCRIPTION 在跑 30-90 分钟长任务之前，校验上游与 delta 关键文件齐全、磁盘空间足够。
+.DESCRIPTION 在跑 30-90 分钟长任务之前，校验上游与 delta 关键文件齐全、
+             控制面板转换产物（config.json）就位、应答模板存在、磁盘空间足够。
              任一缺失立即非零退出，避免空烧 runner。
 #>
 [CmdletBinding()]
@@ -27,14 +28,33 @@ foreach ($f in $required) {
 }
 Log "上游关键文件齐全"
 
-# delta 脚本齐全
+# delta 脚本齐全 —— 编号即执行顺序；本清单必须与 Patch.cmd 的调用、与仓库实际文件三者一致
 $lib = Join-Path $WorkDir 'lib'
-@('01.Build-Manifest.ps1','02.Fetch-Updates.ps1','02b.Fetch-Updates-Meta4.ps1','03.Integrate-VCpp.ps1',
-  '04.Integrate-Drivers.ps1','05.Integrate-Apps.ps1','06.Patch-Components.ps1',
-  '07.Assert-UBR.ps1','08.Bake-Image.ps1','99.Force-W10UI-Ini.ps1') | ForEach-Object {
+@('01.Build-Manifest.ps1','02.Fetch-Updates.ps1','03.Integrate-Drivers.ps1',
+  '04.Integrate-Apps.ps1','05.Patch-Components.ps1','06.Assert-UBR.ps1',
+  '07.Bake-Image.ps1','99.Force-W10UI-Ini.ps1') | ForEach-Object {
     if (-not (Test-Path (Join-Path $lib $_))) { Log "FAIL 缺少 delta 脚本: $_"; throw "预检失败: $_" }
 }
 Log "delta 脚本齐全"
+
+# 控制面板转换产物：Linux 侧 tools/config-to-json.py 生成；pwsh 侧只读 JSON，不解析 YAML
+$cfgJson = Join-Path $WorkDir 'config.json'
+if (-not (Test-Path $cfgJson)) {
+    Log "FAIL 缺少 config.json: $cfgJson（构建前须先跑 tools/config-to-json.py）"
+    throw "预检失败: config.json"
+}
+try {
+    $cfg = Get-Content $cfgJson -Raw -Encoding UTF8 | ConvertFrom-Json
+} catch {
+    Log "FAIL config.json 解析失败: $($_.Exception.Message)"; throw
+}
+if (-not $cfg.branches.$BranchId) { Log "FAIL config.json 里没有分支 $BranchId"; throw "预检失败: 分支未定义" }
+Log "config.json 就位（分支 $BranchId 已定义）"
+
+# 应答模板（单一文件，两分支共用）
+$un = Join-Path $WorkDir 'config\unattend.xml'
+if (-not (Test-Path $un)) { Log "FAIL 缺少应答模板: $un"; throw "预检失败: unattend.xml" }
+Log "应答模板存在"
 
 # 磁盘空间（建议 >= 50GB 空闲于 WorkDir 所在盘）
 $drive = (Get-Item $WorkDir).PSDrive.Name

@@ -24,7 +24,7 @@ jobs:
     # GitHub-hosted runner 硬上限 6 小时；写更大的值无效（到点仍会按执行上限取消）。
     timeout-minutes: 360
     steps:
-      - name: Checkout（config.yml + merge.cmd 模板）
+      - name: Checkout（config.yml + assets/release/merge.cmd 模板）
         uses: actions/checkout@v4
 
       - name: 安装 aria2
@@ -143,10 +143,11 @@ jobs:
             EXP_LINES="${EXP_LINES}set \"EXP_${ISO}=${SHA}\""$'\n'
           done <<< "$ROWS"
 
+          MERGE_TPL="assets/release/merge.cmd"
           mkdir -p dist
-          sed -n '1,/===EXPECTED_HASHES_START===/p' merge.cmd > dist/merge.cmd
+          sed -n '1,/===EXPECTED_HASHES_START===/p' "$MERGE_TPL" > dist/merge.cmd
           printf '%s' "$EXP_LINES" >> dist/merge.cmd
-          sed -n '/===EXPECTED_HASHES_END===/,$p' merge.cmd >> dist/merge.cmd
+          sed -n '/===EXPECTED_HASHES_END===/,$p' "$MERGE_TPL" >> dist/merge.cmd
           ensure_release
           gh release upload baseline --repo "$REPO" --clobber dist/merge.cmd
           rm -rf dist
