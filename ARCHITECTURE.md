@@ -74,7 +74,7 @@ Win-LTSC-ISO/                         ← 你的公开仓库
 ./src/Patch.cmd ──▶ 7z解ISO → DISM读build/arch → A清单 → B下载 → W10UI集成 → E(VC/驱动/应用) → 06精简 → D断言 → oscdimg封装
         │
 成品 ISO ──▶ RAW 切分(≤1.9GiB/片, .part1/2/3) + 生成带哈希的 merge.cmd ──▶ Release(分块+merge.cmd) + R2(可选) + OneDrive(可选)
-          Release 标签格式：YYMMDD-UBR-W10 / YYMMDD-UBR-W11；ISO 名：zh-cn_windows_XX_..._x64_YYMMDD_UBR.iso
+          Release 标签格式：YYMMDD-UBR-Win10 / YYMMDD-UBR-Win11；ISO 名：zh-cn_windows_XX_..._x64_YYMMDD_UBR.iso
           baseline Release：各源镜像的 RAW 分块 + merge.cmd（源镜像与产出明显分开）   [KEEP_RELEASE / KEEP_R2 / KEEP_ONEDRIVE 各自独立]
           构建份数 = config.yml 的 baseline.sources 条数（清单驱动，工作流不重复写地址/哈希）：
             build_iso.yml 的 plan 任务解析清单 → 输出矩阵 → build 任务按矩阵并行构建

@@ -85,7 +85,7 @@ jobs:
               continue
             fi
             VER="$(printf '%s' "$LABEL" | grep -oiP 'win\K[0-9]+' | head -1)"
-            EDITION="W${VER}"
+            EDITION="Win${VER}"
             MATRIX="${MATRIX}${SEP}{\"branch\":\"${BR}\",\"edition\":\"${EDITION}\",\"iso\":\"${ISO}\",\"sha256\":\"${SHA}\"}"
             SEP=","
           done <<< "$ROWS"

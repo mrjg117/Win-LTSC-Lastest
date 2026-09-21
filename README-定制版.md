@@ -59,7 +59,7 @@
   （baseline 原版 ISO 同样 RAW 切分：`zh-cn_windows_11_enterprise_ltsc_2024_x64_dvd_cff9cd2d.iso.part1/2/3…`，配同一份 `merge.cmd`。）
 - **R2 / OneDrive**：整文件直传；保留数 `KEEP_R2` / `KEEP_ONEDRIVE` 独立（R2 免费额度小，默认关，开时调 1~2）。
 - 三端各自 `prune` 到保留数，旧的自动删。
-- **产出命名**：Release 标签 `YYMMDD-UBR-W10` / `YYMMDD-UBR-W11`；ISO 名 `zh-cn_windows_11_enterprise_ltsc_2024_x64_YYMMDD_UBR.iso`（含日期+UBR）。baseline 用微软原版名，源镜像与产出明显分开。
+- **产出命名**：Release 标签 `YYMMDD-UBR-Win10` / `YYMMDD-UBR-Win11`；ISO 名 `zh-cn_windows_11_enterprise_ltsc_2024_x64_YYMMDD_UBR.iso`（含日期+UBR）。baseline 用微软原版名，源镜像与产出明显分开。
 
 ---
 
