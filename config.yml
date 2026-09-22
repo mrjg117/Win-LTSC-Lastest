@@ -31,19 +31,19 @@ baseline:
 #   以 -Package 结尾  → 按 Package 卸载
 #   其余             → 按 Optional Feature 关闭
 remove:
-  # 能力
-  - XPS.Viewer~~~~0.0.1.0
-  - App.StepsRecorder~~~~0.0.1.0
-  - QuickAssist~~~~0.0.1.0
-  # 包
-  - Microsoft-Windows-CameraBarcodeScanner-Package
-  - Microsoft-Windows-USBFunction-Package
-  - Microsoft-Windows-NetworkMobileHandlers-Package
-  - Microsoft-Windows-DesktopFileExplorer-Package
-  - Microsoft-Windows-UEV-Package
-  - Microsoft-Windows-LegacyWordbreaker-Package
-  - Microsoft-Windows-BootEnvironment-Dvd-Package
-  - Microsoft-Windows-3DAudio-HRTFData-Package
+  # ===== 能力（Capability，名字含 ~~~~）=====
+  - XPS.Viewer~~~~0.0.1.0          # XPS 文档查看器
+  - App.StepsRecorder~~~~0.0.1.0   # 步骤记录器（psr.exe）
+  - QuickAssist~~~~0.0.1.0         # 快速助手（远程协助）
+  # ===== 包（Package，以 -Package 结尾）=====
+  - Microsoft-Windows-CameraBarcodeScanner-Package   # 相机条码扫描器
+  - Microsoft-Windows-USBFunction-Package            # USB 设备（MTP）功能角色
+  - Microsoft-Windows-NetworkMobileHandlers-Package   # 移动网络（手机网络）处理
+  - Microsoft-Windows-DesktopFileExplorer-Package     # ⚠ 桌面文件资源管理器：删后仅剩 UWP 管理器，原配置即如此，慎用
+  - Microsoft-Windows-UEV-Package                    # 用户体验虚拟化（UE-V）
+  - Microsoft-Windows-LegacyWordbreaker-Package       # 旧版断字（西文排版）
+  - Microsoft-Windows-BootEnvironment-Dvd-Package     # 从 DVD 启动的引导环境
+  - Microsoft-Windows-3DAudio-HRTFData-Package        # 3D 音频 HRTF 数据
 
 # ---- 每分支构建目标 ----
 branches:
@@ -60,14 +60,12 @@ branches:
     #   WMP + Media Foundation + 全套音视频编解码（MPEG / WMA / AAC / FLAC / AC-3…）+ WPD 便携设备。
     #   卸掉它，Edge / 照片 / Teams / 摄像头 / 语音输入会一并坏掉；WMP 本体由独立的系统
     #   removable package `Microsoft-Windows-MediaPlayback-OC`（Package Size 0 KB 的纯开关）管理。
-    apps:                             # 本分支应用（与上方全局 apps 合并去重）
-      - 9WZDNCRFJBMP                  # Microsoft Store（LTSC 出厂不带）
+    apps:                             # 本分支专属应用（与全局 apps 合并去重；两分支都装的放全局）
       # 其余一律不再预置商店包 —— 这几项改用「系统自带老组件 + 免安装工具」：
       #   画图 / 记事本 —— LTSC 出厂自带经典版（mspaint.exe / notepad.exe），不用补；
       #     商店版是 AI 重型包（Paint bundle 722 MB，其中 330 MB 是 .onnxe 模型权重）
       #   播放器 —— components 段的 MPC-BE（自带全解码、HDR/DV，比 WMP+解码包更小更好）
-      #   解压   —— components 段的 7-Zip 26.03（NanaZip 虽同为 7-Zip 内核，但 MSIX 形态有
-      #     盘符右键仅 Win11、首启需联网取 license、AppData 重定向等硬限制）
+      #   解压   —— 全局 apps 段的 NanaZip（MSIX 正常应用，按 Store 流程预置）
   "19044":
     label: Win10-LTSC-2021
     edition: IoTEnterpriseS
@@ -80,7 +78,6 @@ branches:
       - MicrosoftWindowsPowerShellV2Root
     # 应用与全局 apps 合并去重，写法与 26100 分支相同。
     apps:
-      - 9WZDNCRFJBMP                  # Microsoft Store
       # [实测推翻旧结论] 曾以为"新版 MSIX 的 MinVersion 钉 Windows 11，Win10 装不上"。
       #   实测现行包 Microsoft.WindowsStore_22608.1401.3.0 的 TargetDeviceFamily：
       #     MinVersion = 10.0.18362.0（Win10 1903）、MaxVersionTested = 10.0.26100.0
@@ -185,21 +182,29 @@ optimize:
   #       unattend.xml（synthesize pass），首次开机由 Windows 自己装一遍，跑完自删。
   #       得到的是正常安装：装到官方默认目录（C:\Program Files\…）、可卸载、有「应用和功能」条目。
   # 装法与参数由安装器类型自动判定，判不出即报错（绝不猜，猜错会弹出图形向导而不报错）：
-  #   .msi            → msiexec /i "<文件>" /qn /norestart
-  #   .exe (Inno)     → /VERYSILENT /SP- /SUPPRESSMSGBOXES /NORESTART
-  #   .exe (NSIS)     → /S
-  #   .exe (vc_redist) → /install /quiet /norestart
-  #   .zip            → 内含唯一安装器时自动解出内层 .exe/.msi；其余形态报错
+  #   .msi                  → msiexec /i "<文件>" /qn /norestart
+  #   .exe (Inno)           → /VERYSILENT /SP- /SUPPRESSMSGBOXES /NORESTART
+  #   .exe (NSIS)           → /S
+  #   .exe (vc_redist/vc14) → /install /quiet /norestart
+  #   .exe (vcredist/2010)  → /q /norestart
+  #   .exe (dotnet 运行时)   → /install /quiet /norestart
+  #   .exe (directx Jun2010) → 先 /Q /C /T: 解出 DXSETUP.exe，再 DXSETUP.exe /silent /norestart
+  #   .zip                  → 内含唯一安装器时自动解出内层 .exe/.msi；其余形态报错
   # 路径与设置一律走官方默认（不传 /DIR、不传 INSTALLDIR、不动组件勾选）：
-  #   7-Zip  (x64 exe) → C:\Program Files\7-Zip        （官方 FAQ：/S + /D=，两者大小写敏感）
   #   MPC-BE (x64 安装器) → C:\Program Files\MPC-BE x64 （官方 iss 的 DefaultDirName={pf}\MPC-BE x64）
   #   NDM    (Inno 5.5.7) → C:\Program Files (x86)\Neat Download Manager（官方安装器默认，实测确认）
+  #   运行库（VC++ / .NET / DX）均装到系统默认目录（%SystemRoot%\System32 / Program Files），无需指定
   components:
-    vc14_x64: https://aka.ms/vs/17/release/vc_redist.x64.exe
-    vc14_x86: https://aka.ms/vs/17/release/vc_redist.x86.exe
-    7zip:     https://github.com/ip7z/7zip/releases/download/26.03/7z2603-x64.exe
-    mpcbe:    https://github.com/Aleksoid1978/MPC-BE/releases/download/1.9.1/MPC-BE.1.9.1.x64-installer.zip
-    ndm:      https://www.neatdownloadmanager.com/file/NeatDM_setup.exe
+    # —— 共享运行库（多个组件 / 程序共用，首次开机静默装到系统目录）——
+    vc14_x64:       https://aka.ms/vs/17/release/vc_redist.x64.exe     # VC++ 2015-2022 x64（MPC-BE 等 C++ 程序共用）
+    vc14_x86:       https://aka.ms/vs/17/release/vc_redist.x86.exe     # VC++ 2015-2022 x86
+    vcredist_x64:   https://download.microsoft.com/download/1/6/5/165255E7-1014-4D0A-B094-B6A430A6B958/vcredist_x64.exe  # VC++ 2010 x64（老组件 / 老游戏）
+    vcredist_x86:   https://download.microsoft.com/download/1/6/5/165255E7-1014-4D0A-B094-B6A430A6B958/vcredist_x86.exe  # VC++ 2010 x86
+    dxruntime:      https://download.microsoft.com/download/6/5/B/65B16A3D-6D7F-4C2D-BC0C-9B8B1A9C0E8E/directx_Jun2010_redist.exe  # DirectX 最终用户运行时（Jun2010，补老游戏 D3DX9 / XInput / XAudio 等）
+    dotnet9_desktop: https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/9.0.18/windowsdesktop-runtime-9.0.18-win-x64.exe  # .NET 9 Desktop Runtime（含 .NET Runtime，WPF/WinForms 程序）
+    # —— 桌面应用安装器 ——
+    mpcbe:    https://github.com/Aleksoid1978/MPC-BE/releases/download/1.9.1/MPC-BE.1.9.1.x64-installer.zip   # MPC-BE 播放器
+    ndm:      https://www.neatdownloadmanager.com/file/NeatDM_setup.exe   # Neat Download Manager
     # dotnet8: https://...
     #
     # 汉化覆盖（可选，通用规则）：把要替换的文件放到 delta/assets/overwrite/<组件名>/ 下即生效 ——
@@ -208,7 +213,7 @@ optimize:
     #     delta/assets/overwrite/ndm/Languages/zh-CN.ini          → 覆盖 <安装目录>\Languages\zh-CN.ini
     #   构建期这些文件被打进 C:\Tools\install\ow_<组件名>\，首次开机装完该组件后由 unattend 里
     #   追加的 copy 命令覆盖过去（纯文件复制，不需要任何脚本 / Python）。
-    #   覆盖目标 = 该组件的官方默认安装目录（目前已登记：ndm / 7zip / mpcbe），未登记的组件直接报错。
+    #   覆盖目标 = 该组件的官方默认安装目录（目前已登记：ndm / mpcbe），未登记的组件直接报错。
     #   NDM 汉化成品来源需自行确认：exe 汉化必然破签名，无法验证完整性，故本仓库不内置该文件。
     #   实测可用的成品：github.com/wmwlwmwl/NeatDM-CN 的 out/NeatDM.exe（对应官方 1.4.24）
 
@@ -227,8 +232,9 @@ optimize:
 #          /SkipLicense 预置非 Store 来源的包时，必须同时启用 optimize 里的
 #          allow_all_trusted_apps，否则用户首次登录注册会失败、应用打不开。
 apps:
-  # 全分支通用项写这里（示例：Terminal 支持 Win10 1809+，两支都能用）
-  # - https://github.com/microsoft/terminal/releases/download/<版本>/Terminal.msixbundle
+  # 全分支通用应用（写这里 = 两分支都装，脚本合并去重）
+  - 9WZDNCRFJBMP                  # Microsoft Store（LTSC 出厂不带；两分支共用同一产品 ID，故放全局一次）
+  - https://github.com/M2Team/NanaZip/releases/download/7.0.1843.0/NanaZip_7.0.1843.0.msixbundle  # NanaZip 7.0 文件管理器（替代 7-Zip；license.xml 由抓取脚本按同名自动配对）
 
 # ---- 上传：值 = 保留份数；注释 / 不写 = 不上传 ----
 storage:

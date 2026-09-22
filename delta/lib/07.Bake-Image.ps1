@@ -120,6 +120,19 @@ function Get-SilentArgs {
     param([Parameter(Mandatory)] [string] $Name, [Parameter(Mandatory)] [System.IO.FileInfo] $File)
     $head = [IO.File]::ReadAllBytes($File.FullName)[0..([Math]::Min(1MB, $File.Length - 1))]
     $text = [Text.Encoding]::ASCII.GetString($head)
+    # 已知具名例外：命中即采用其已验证参数，且必须先于下方启发式头检测 ——
+    # 否则 NSIS/Inno 打包的已知安装器会被头检测抢先、用错静默参数（例如 VC++ 2010 的
+    # vcredist_*.exe 是 NSIS 包，头检测会误给 /S 而非官方 /q /norestart，导致首启装失败）。
+    if ($Name -match '^7z') { return '/S' }                                        # 7-Zip（NSIS，精简包可能无 Nullsoft 标记）
+    if ($Name -match 'vc_redist|vc14') { return '/install /quiet /norestart' }     # VC++ 2015-2022
+    if ($Name -match 'vcredist') { return '/q /norestart' }                         # VC++ 2010（vcredist_x86/x64.exe）
+    if ($Name -match 'dotnet|windowsdesktop') { return '/install /quiet /norestart' }  # .NET 运行时
+    if ($Name -match 'directx|dxruntime') {
+        # Jun2010 自解包：先 /Q /C /T: 解出 DXSETUP.exe 到子目录，再静默装（/silent 不弹 EULA）
+        $dx = '%SystemDrive%\Tools\install\dx'
+        return "/Q /C /T:`"$dx`" && `"$dx\DXSETUP.exe`" /silent /norestart"
+    }
+    # 启发式头检测：仅对上面没认出的 .exe 生效
     if ($text -match 'Inno Setup') {
         # Inno Setup 官方命令行文档：/VERYSILENT 无 UI，/SP- 去掉启动提示，
         # /SUPPRESSMSGBOXES 抑制对话框，/NORESTART 不重启
@@ -129,9 +142,6 @@ function Get-SilentArgs {
         # NSIS：/S 静默（**必须大写**）
         return '/S'
     }
-    # 已知具名例外：7-Zip 的 exe 是 NSIS，但精简过的安装器里可能搜不到 "Nullsoft" 标记
-    if ($Name -match '^7z') { return '/S' }
-    if ($Name -match 'vc_redist|vc14') { return '/install /quiet /norestart' }
     throw "components.$Name 是 .exe 但认不出安装器类型（Inno/NSIS/已知具名），无法确定静默参数 —— 请显式补一条规则，别用猜的"
 }
 

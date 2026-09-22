@@ -32,11 +32,11 @@ import io
 import json
 import os
 import re
-import shutil
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 # Windows runner 的 l10n 是 en-US，Python 3.12 的 stdout 会回退到 cp1252 —— 一 print 中文就抛
 # UnicodeEncodeError 把整个 step 打挂（CI 实测：日志里 `下载组件 …` 那一行直接炸）。
 # 显式把标准流切到 UTF-8，脚本在任何宿主（cp1252 / cp936 / POSIX）上都能安全输出中文。
@@ -290,6 +290,20 @@ def fetch_apps(cfg, dest, branch, list_only=False):
             else:
                 log(f"SKIP 已存在: {key}/{fname}")
             rec["main"].append(os.path.relpath(path, dest).replace("\\", "/"))
+            # 旁加载 MSIX（GitHub 发布的 .msix/.msixbundle 等）常附带同名 .xml license，
+            # 离线预置时用来绕过 Store 签名信任。有就配对，没有也不致命（退回 /SkipLicense）。
+            if fname.lower().endswith((".msix", ".msixbundle", ".appx", ".appxbundle")):
+                stem = os.path.splitext(value)[0]
+                lic_url = stem + ".xml"
+                lic_path = os.path.join(adir, "license.xml")
+                if not (os.path.isfile(lic_path) and os.path.getsize(lic_path) > 0):
+                    try:
+                        log(f"下载 license {key} <- {lic_url}")
+                        download(lic_url, lic_path)
+                    except Exception as e:          # noqa: BLE001 - license 缺失不阻断主包
+                        log(f"WARN 未取得 license.xml（将用 /SkipLicense）: {e}")
+                else:
+                    log(f"SKIP 已存在: {key}/license.xml")
         else:
             log(f"解析 Store 产品 ID {value}")
             mains, deps = classify(rg_list(value))

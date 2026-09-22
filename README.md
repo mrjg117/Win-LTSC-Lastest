@@ -105,16 +105,17 @@
 ```
 
 **安装路径与设置一律走官方默认**：不传 `/DIR`、不传 `INSTALLDIR`、不勾选/取消任何组件：
-- 7-Zip（x64 exe）→ `C:\Program Files\7-Zip`（官方 FAQ：`/S` + `/D=`，两者**大小写敏感**）
 - MPC-BE（x64 安装器）→ `C:\Program Files\MPC-BE x64`（官方 `distrib\mpc-be_setup.iss` 的
   `DefaultDirName={pf}\MPC-BE x64`；`ArchitecturesInstallIn64BitMode=x64` 保证 `{pf}`= 真 Program Files）
 - Neat Download Manager（Inno Setup）→ `C:\Program Files (x86)\Neat Download Manager`（32 位应用）
 - 默认组件（main / mpciconlib / mpcresources / mpcvr）与默认快捷方式全保留
+- 运行库（VC++ 2010 / 2015-2022、.NET 9、DirectX Jun2010）装到系统默认目录（System32 / Program Files），无需指定
+- 解压工具 **NanaZip** 走 `apps` 段（MSIX 正常应用，按 Store 流程离线预置），不在此列
 
 > 载荷选择跟着**官方发行形态**走，不自己拼：
-> 7-Zip 官方推荐 exe 安装器（FAQ 原文 "recommend to use exe type installer"），取 `7z2603-x64.exe`；
 > MPC-BE 官方只发 `MPC-BE.<ver>.x64.7z`（便携）与 `MPC-BE.<ver>.x64-installer.zip`（内含单个 Inno 安装器）
 > —— 要装到 Program Files 就走后者。
+> 7-Zip 已弃用：改用 **NanaZip**（同为 7-Zip 内核，MSIX 形态，作为正常应用预置）。
 
 装完想替换掉安装器铺下的某个文件（典型：换汉化版主程序），就把它按**组件名 + 原相对路径**
 放进 `delta/assets/overwrite/<组件名>/`，构建期会打进 `C:\Tools\install\ow_<组件名>\`，
@@ -212,10 +213,11 @@ UBR 用 06 实测值，不猜。
 除上述之外，镜像不往 C 盘写任何自建文件：不建服务、不建计划任务、不留首启脚本。
 
 > **安装到哪儿了？** 组件走各自**官方默认路径**，都在 `C:\Program Files\` 下，跟手动安装完全一样：
-> `C:\Program Files\7-Zip\`（有 `7zFM.exe`，右键菜单已注册）、
 > `C:\Program Files\MPC-BE x64\`（有 `mpc-be64.exe`，桌面/开始菜单快捷方式已建）、
-> `C:\Program Files (x86)\Neat Download Manager\`（32 位应用）。
+> `C:\Program Files (x86)\Neat Download Manager\`（32 位应用）、
+> 运行库（VC++ / .NET / DirectX）装到系统默认目录。
 > 都可在「设置 → 应用和功能」里正常卸载 —— 因为它们就是真的安装过。
+> 解压工具 **NanaZip** 是 MSIX 应用（WindowsApps 下），同样可在「应用和功能」里卸载。
 
 ### 5.2 组件怎么装上的：Windows 自己的应答机制，不是首启脚本
 
@@ -345,9 +347,14 @@ optimize:
 ```yaml
 optimize:
   components:
-    7zip:  https://github.com/ip7z/7zip/releases/download/26.03/7z2603-x64.exe
-    ndm:   https://www.neatdownloadmanager.com/file/NeatDM_setup.exe
+    vc14_x64:       https://aka.ms/vs/17/release/vc_redist.x64.exe      # VC++ 2015-2022
+    vcredist_x64:   https://download.microsoft.com/download/1/6/5/165255E7-1014-4D0A-B094-B6A430A6B958/vcredist_x64.exe  # VC++ 2010
+    dxruntime:      https://download.microsoft.com/download/6/5/B/65B16A3D-6D7F-4C2D-BC0C-9B8B1A9C0E8E/directx_Jun2010_redist.exe  # DirectX Jun2010
+    dotnet9_desktop: https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/9.0.18/windowsdesktop-runtime-9.0.18-win-x64.exe  # .NET 9
+    mpcbe:  https://github.com/Aleksoid1978/MPC-BE/releases/download/1.9.1/MPC-BE.1.9.1.x64-installer.zip
+    ndm:    https://www.neatdownloadmanager.com/file/NeatDM_setup.exe
 ```
+> 解压工具 **NanaZip** 不再放 `components`，而是放 `apps`（MSIX 正常应用，离线预置，见 5.1）。
 
 #### 防呆（任一处不对都直接报错，绝不静默失效）
 
@@ -436,11 +443,11 @@ Server 是 `26100.33451`，客户端真值却是 `26100.9457`），取最大值�
 | 应用包下载渠道 | 微软官方只给「产品 ID → WuCategoryId」（`displaycatalog.mp.microsoft.com`，无需认证）。真正的包 URL 在 WU 交付服务里，要过 [MS-WUSP] 的签名与时效 Cookie —— 所以 `tools/fetch-payloads.py` 用社区事实标准 `store.rg-adguard.net` 换链接（**它返回的仍是微软官方 CDN 直链**）。这是第三方单点，失败时会直接报错，不会静默漏包 |
 | 应用 license | `license.xml` 公开渠道拿不到（需 Entra 认证，Store for Business 已于 2024-08 退役）。规则：同名 `.xml` 放对应载荷目录就带上，没有则 `/SkipLicense` + 开 `AllowAllTrustedApps`。**存在付费类应用不激活的风险** |
 | Win10 分支的 MSIX | **实测修正**：原以为「新版 MSIX 的 `MinVersion` 钉 Win11、强注报 `0x80073cfd`」。实测现行 Store 包 `Microsoft.WindowsStore_22608.1401.3.0` 的 `TargetDeviceFamily` 为 `MinVersion=10.0.18362.0`（Win10 1903）/ `MaxVersionTested=10.0.26100.0` → 19044 满足，两分支共用同一产品 ID 即可。**判断某个包能不能装，去读它的 manifest，别按印象推** |
-| 预装应用取舍 | 商店包只留 **Microsoft Store 本体**（LTSC 出厂不带）。画图 / 记事本用 LTSC 自带的经典版；播放器用 MPC-BE、解压用 7-Zip（走 `components`，见 5.1）。商店版 Paint / 照片是 AI 重型包 —— Paint bundle 722 MB 里 330 MB 是 `.onnxe` 模型权重，新版照片 1117 MB 里约 596 MB 是 AI 载荷 —— 对 LTSC 是纯负重 |
+| 预装应用取舍 | 商店包只留 **Microsoft Store 本体**（LTSC 出厂不带，放全局 `apps` 一次两分支共用）。画图 / 记事本用 LTSC 自带的经典版；播放器用 MPC-BE、解压用 NanaZip（走 `apps` 段 MSIX 预置，见 5.1）。商店版 Paint / 照片是 AI 重型包 —— Paint bundle 722 MB 里 330 MB 是 `.onnxe` 模型权重，新版照片 1117 MB 里约 596 MB 是 AI 载荷 —— 对 LTSC 是纯负重 |
 | 转 IoT 的 SKU 转换 | 中文镜像 `install.wim` 通常只有一个 index，但 `Dism /Get-TargetEditions` 允许升到 `IoTEnterpriseS`。**需首次实跑确认**（07 里已按官方 GVLK 写死映射，并做了转换后复检） |
 | 组件包名 / 功能名 | `remove` 里的名字需用 `Get-WindowsPackage` / `Get-WindowsCapability` 在真机校准；不存在或已被 LCU 取代的项会 SKIP |
 | 驱动 | 全量池注入 `install.wim` 留盘，PnP 只装匹配硬件 |
-| VC++ 运行库 / 7-Zip / MPC-BE | **无法构建期注入镜像**（DISM 只吃 cab/msu）→ 写进 `unattend.xml` 的 synthesize pass，首次开机静默装到官方默认路径（见 5.2） |
+| VC++ 运行库 / .NET / DirectX / MPC-BE / NDM | **无法构建期注入镜像**（DISM 只吃 cab/msu）→ 写进 `unattend.xml` 的 synthesize pass，首次开机静默装到官方默认路径（见 5.2）；NanaZip 走 `apps` 段按 MSIX 预置 |
 
 ### 8.1 脚本的文本编码约定（改脚本前必读）
 
@@ -455,7 +462,8 @@ Server 是 `26100.33451`，客户端真值却是 `26100.9457`），取最大值�
 | `manifest.json`、生成的 `.cmd` | **UTF-8 无 BOM**（用 .NET `UTF8Encoding($false)` 写） | 同一句 `Set-Content -Encoding UTF8` 在 5.1 写 BOM、在 7 不写，行为会随宿主漂移；显式 .NET 编码才两端一致 |
 | 上游 `W10UI.ini` | **字节保真**（ISO-8859-1 做 1:1 字节映射读写） | 它的编码不由我们控制；只改命中的 ASCII 键，未命中行逐字节不动，绝不写 BOM、不换换行符 |
 | Python 脚本的 `print` | 开头 `sys.stdout.reconfigure(encoding="utf-8", errors="replace")` | CI 的 Windows runner 是 en-US，stdout 回退 cp1252，一打印中文就 `UnicodeEncodeError` 整步挂掉（本机 cp936 永远测不出来） |
-| `shell: bash` 里**别调 `python`** | Windows 上要调 python 的 step 一律用 `shell: pwsh` | windows runner 的 Git Bash 里**没有 `python` 命令**（实测 `/bin/bash: line 1: python: command not found`）→ 整个 step 挂；`actions/setup-python` 装的是 Windows 版 `python.exe`，只在 PowerShell 的 PATH 里可靠可见 |
+| Python 脚本的 `import` | 提交前跑一遍 `python -m pyflakes tools/*.py` | 漏一个 import 在**运行到那一行时**才炸，编译期（`py_compile`）查不出来 —— 实测 `fetch-payloads.py` 漏 `import zipfile`，本地没走到解包分支所以全绿，CI 必挂 |
+| `shell: bash` 里调 `python` | 可以调，`actions/setup-python` 已把 `python.exe` 注入 PATH | Windows runner 的 Git Bash **能**解析 `python`（runner 日志实测该 step 正常下载组件）；分支参数用 `"${{ matrix.branch }}"` 带引号 |
 
 > **改脚本/表之后务必复查 BOM**：`Edit`/`Write` 工具可能把 BOM 抹掉，而 `.ps1` 少了 BOM
 > 在 5.1 上会静默变成 ANSI 解码 —— 中文先烂，报的却是「意外的标记」这类看不出根因的语法错。
