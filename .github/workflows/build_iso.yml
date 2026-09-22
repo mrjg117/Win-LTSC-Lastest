@@ -210,37 +210,110 @@ jobs:
           Remove-Item chunks, baseline_out.iso -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: 运行 Patch.cmd（A→B→W10UI→E→D）
-        # 上游脚本输出流向稀疏 + 此步最耗时（20~40min），裸跑时 Actions 日志整段空白像卡死。
-        # 这里包一层：输出落盘 + 每 5s 心跳回显最近几行，全程有可见活动，也保留完整日志。
-        # [坑·实测复现] 重定向路径会按「子进程当前目录」解析：若写 `cd src && ... > src\x.log`，
-        #   cd 之后 `src\` 被再拼一层（= src\src\x.log，目录不存在）→ cmd 直接报
+        # 此步最耗时（20~40min），必须让 Actions 日志全程有可见活动，否则像卡死。
+        # [机制] Patch.cmd 自身**不做任何重定向**（本地双击运行时命令窗里是什么就是什么），
+        #   由本步的父进程统一把它接管成 `cmd /c "Patch.cmd <branch> > logs\Patch.log 2>&1"`，
+        #   再用常开的 StreamReader 增量跟随该文件（只打新行、不重复刷屏），每 5s 一轮并打印
+        #   "仍在运行 + 累计行数" 的心跳。于是 命令窗内容 == Patch.log == web 上看到的内容。
+        #   ⚠ 因此**不要**改回 `Patch.cmd` 内部重定向 —— 那会让命令窗彻底空白（历史踩过）。
+        # [坑①·实测复现] 重定向路径按「执行那一刻的当前目录」解析：写 `cd src && ... > src\x.log`
+        #   会把 `src\` 再拼一层（= src\src\x.log，目录不存在）→ cmd 报
         #   "The system cannot find the path specified."、退出码 1，Patch.cmd 一个字符都不跑。
-        #   故这里**不 cd**，改用 ProcessStartInfo.WorkingDirectory 指定工作目录，日志用裸文件名。
+        #   故**不 cd**，用 `working-directory: src` + ProcessStartInfo.WorkingDirectory 指定工作目录，
+        #   重定向写相对路径 `logs\Patch.log`（相对 src 解析，正好落在 src\logs\Patch.log）。
+        # [坑②] 重定向目标所在目录必须**先存在**：cmd 在启动那一刻就会打开文件，目录不在即秒退。
+        #   故先 mkdir src\logs（Patch.cmd 自己也建，双保险）。
+        # [编码] 先 chcp 65001：Patch.cmd 是 UTF-8 文件、含中文 echo，控制台输出码页不设成
+        #   65001 会整片乱码。上游 W10UI.cmd 实测纯 ASCII，不受影响。
+        #   ⚠ 不要在 Patch.cmd 里 chcp（批处理中途改码页会让 cmd 行偏移错位，已知会跳行），
+        #     码页必须在父进程设好。
         if: env.SKIP != '1'
         shell: pwsh
+        working-directory: src
         run: |
-          $log = "src\patch_console.log"
-          Remove-Item $log -Force -ErrorAction SilentlyContinue
-          $wd = Join-Path $PWD "src"
-          if (-not (Test-Path $wd)) { throw "找不到上游快照目录: $wd（前面的『套 delta 到上游快照』步是否成功？）" }
+          chcp 65001 > $null
+          try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
+
+          New-Item -ItemType Directory -Force -Path "logs" | Out-Null
+          $patchlog = "logs\Patch.log"
+          Remove-Item $patchlog -Force -ErrorAction SilentlyContinue
+          $wd = (Get-Location).Path
+          if (-not (Test-Path (Join-Path $wd "Patch.cmd"))) {
+            throw "找不到上游快照里的 Patch.cmd: $wd（前面的『套 delta 到上游快照』步是否成功？）"
+          }
+
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = "cmd.exe"
-          $psi.Arguments = "/c Patch.cmd ${{ matrix.branch }} > patch_console.log 2>&1"
+          # 父进程统一重定向：本地命令窗与 CI 的 Patch.log 拿到的是同一份字节。
+          # 先在本条命令行里 chcp 65001（不是写进 Patch.cmd！见上面的编码说明）——
+          # 这样 cmd 进程自身及其所有子进程都按 UTF-8 输出，批处理里的中文 echo 才不乱码。
+          $psi.Arguments = "/c chcp 65001 >nul & Patch.cmd $env:BRANCH > $patchlog 2>&1"
           $psi.UseShellExecute = $false
           $psi.WorkingDirectory = $wd
           $p = [System.Diagnostics.Process]::Start($psi)
-          Write-Host "Patch.cmd 启动 (PID $($p.Id), cwd=$($psi.WorkingDirectory))"
-          while (-not $p.HasExited) {
-            Start-Sleep -Seconds 5
-            if (Test-Path $log) { Get-Content $log -Tail 8 -ErrorAction SilentlyContinue | ForEach-Object { "· $_" } }
-            Write-Host "… Patch.cmd 仍在运行 ($([math]::Round((Get-Date).Subtract($p.StartTime).TotalMinutes,1)) min)"
-          }
+          Write-Host "Patch.cmd 启动 (PID $($p.Id), cwd=$wd, 分支=$env:BRANCH)"
+          Write-Host "命令窗内容跟随: $patchlog（Patch.cmd 自身零重定向，全部原样落这里）"
+
+          $reader = $null
+          $lines  = 0
+          try {
+            while (-not $p.HasExited) {
+              Start-Sleep -Seconds 5
+              # 日志文件由 cmd 在启动时创建，出现后再打开并保持（FileShare.ReadWrite 允许边写边读）
+              if ($null -eq $reader -and (Test-Path $patchlog)) {
+                try {
+                  $fs = [System.IO.File]::Open($patchlog, [System.IO.FileMode]::Open,
+                        [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                  $reader = New-Object System.IO.StreamReader($fs)
+                } catch { $reader = $null }
+              }
+              if ($reader) {
+                while ($true) {
+                  $ln = $reader.ReadLine()
+                  if ($null -eq $ln) { break }
+                  Write-Host $ln
+                  $lines++
+                }
+              }
+              Write-Host "… Patch.cmd 仍在运行 ($([math]::Round((Get-Date).Subtract($p.StartTime).TotalMinutes,1)) min, 累计输出 $lines 行)"
+            }
+          } finally { if ($reader) { $reader.Dispose() } }
+
           $mins = [math]::Round((Get-Date).Subtract($p.StartTime).TotalMinutes, 1)
-          Write-Host "=== Patch.cmd 已退出（退出码 $($p.ExitCode)，耗时 $mins min），末 200 行 ==="
-          if (Test-Path $log) { Get-Content $log -Tail 200 -ErrorAction SilentlyContinue | ForEach-Object { "· $_" } }
-          else { Write-Host "！未生成 $log —— 子进程可能秒退，检查上面的 cwd / Patch.cmd 是否存在" }
-          if ($p.ExitCode -ne 0) { throw "Patch.cmd 退出码 $($p.ExitCode)" }
-          Write-Host "Patch.cmd 完成 (退出码 0)"
+          Write-Host "=== Patch.cmd 已退出（退出码 $($p.ExitCode)，耗时 $mins min，累计输出 $lines 行）==="
+          if ($lines -eq 0) {
+            if (Test-Path $patchlog) {
+              Write-Host "=== 流式跟随未取到内容，兜底打印 $patchlog 末 200 行 ==="
+              Get-Content $patchlog -Tail 200 | ForEach-Object { Write-Host $_ }
+            } else {
+              Write-Host "！未生成 $patchlog —— 子进程可能在启动那一刻就失败了，检查上面的 cwd / 重定向目录"
+            }
+          }
+          if ($p.ExitCode -ne 0) {
+            # [关键] 把失败现场写进 GitHub annotation。annotation 走 check-runs API：
+            #     GET /repos/{owner}/{repo}/check-runs/{job_id}/annotations
+            #   **无需登录/无需令牌即可读取**；而原始 job 日志（.../jobs/{id}/logs）必须认证，
+            #   匿名访问只会 403。故 annotation 是本项目在无凭据环境下定位 CI 失败的唯一通道。
+            #   转义规则（GitHub workflow command 约定）：行内 % -> %25，行间换行 -> %0A。
+            $tail = @()
+            if (Test-Path $patchlog) { $tail = @(Get-Content $patchlog -Tail 25 -ErrorAction SilentlyContinue) }
+            $esc  = ($tail | ForEach-Object { ($_ -replace '%','%25').TrimEnd() }) -join '%0A'
+            if ($esc.Length -gt 3800) { $esc = $esc.Substring($esc.Length - 3800) }
+            Write-Host ("::error title=Patch.cmd failed exit=" + $p.ExitCode + " elapsedMin=" + $mins + " (logs last 25 lines)::" + $esc)
+            throw "Patch.cmd 退出码 $($p.ExitCode)"
+          }
+          Write-Host "Patch.cmd 完成（退出码 0）"
+
+      - name: 保留 Patch 日志（失败/取消时上传，便于离线排查）
+        # 该步与本 job 其它步骤相互独立：只在前面失败/取消时执行。
+        # src\logs\ 里是 Patch.cmd + 各 lib\*.ps1 的完整日志；runner 销毁后只此一份。
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-logs-branch${{ matrix.branch }}
+          path: src/logs/
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: 读取 UBR -> 计算 TAG / ISO_BASE / 生成 Release（manifest/logs）
         if: env.SKIP != '1'

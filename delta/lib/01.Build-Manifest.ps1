@@ -12,8 +12,9 @@ param(
     [string] $UpstreamCommit = $env:UPSTREAM_COMMIT
 )
 $ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}   # 见 00.Precheck.ps1：输出编码钉死 UTF-8
 $log = Join-Path $WorkDir "logs\01-manifest.log"
-function Log($m){ "$(Get-Date -Format 'HH:mm:ss') $m" | Tee-Object -FilePath $log -Append }
+function Log($m){ $s = "$(Get-Date -Format 'HH:mm:ss') $m"; Write-Host $s; [System.IO.File]::AppendAllText($log, $s + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false))) }
 
 # 1) 读 baseline ISO 的 build/arch（7z 解 sources\install.wim 读 DISM 信息）
 $baselineIso = Join-Path $WorkDir "baseline-$BranchId.iso"

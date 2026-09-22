@@ -15,8 +15,9 @@ param(
     [Parameter(Mandatory)] [string] $BranchId
 )
 $ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}   # 见 00.Precheck.ps1：输出编码钉死 UTF-8
 $log = Join-Path $WorkDir "logs\06-assert.log"
-function Log($m){ "$(Get-Date -Format 'HH:mm:ss') $m" | Tee-Object -FilePath $log -Append }
+function Log($m){ $s = "$(Get-Date -Format 'HH:mm:ss') $m"; Write-Host $s; [System.IO.File]::AppendAllText($log, $s + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false))) }
 
 $mount = Join-Path $WorkDir 'mount'
 $installWim = Join-Path $WorkDir 'ISO\sources\install.wim'

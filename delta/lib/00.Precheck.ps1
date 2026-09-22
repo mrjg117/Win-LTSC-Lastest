@@ -10,8 +10,14 @@ param(
     [Parameter(Mandatory)] [string] $BranchId    # 19044 / 26100
 )
 $ErrorActionPreference = 'Stop'
+# 输出编码钉死 UTF-8：CI runner 是 en-US，无控制台时 .NET 会退回系统 ANSI 码页，
+#   脚本里的中文一输出就整片变 `?`。必须在产生任何输出之前设好（失败也不致命，故 try/catch）。
+try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}
 $log = Join-Path $WorkDir "logs\00-precheck.log"
-function Log($m){ "$(Get-Date -Format 'HH:mm:ss') $m" | Tee-Object -FilePath $log -Append }
+# Log：命令窗（stdout，CI 里由工作流重定向进 logs\Patch.log）+ 自己的 logs\00-precheck.log 双写。
+# [坑] 原来用 `| Tee-Object -FilePath $log`，但 Windows PowerShell 5.1 的 Tee-Object 没有
+#      -Encoding 参数、默认按 ASCII 落盘 —— 中文日志会整片变 `?`。故改用 .NET 显式 UTF-8 追加。
+function Log($m){ $s = "$(Get-Date -Format 'HH:mm:ss') $m"; Write-Host $s; [System.IO.File]::AppendAllText($log, $s + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false))) }
 
 Log "== 预检开始 (branch=$BranchId, workdir=$WorkDir) =="
 
@@ -68,10 +74,13 @@ Log "应答模板存在"
 # 磁盘空间（建议 >= 50GB 空闲于 WorkDir 所在盘）
 $drive = (Get-Item $WorkDir).PSDrive.Name
 $free = (Get-PSDrive -Name $drive).Free / 1GB
+# [坑] ${free:0.0} 里的冒号会被当成作用域限定符（$free: 视为 drive 限定），整段渲染为空，
+#      日志会打成"磁盘空闲  GB OK"。数字格式化一律走 -f，不要写 ${var:format}。
+$freeTxt = "{0:0.0}" -f $free
 if ($free -lt 50) {
-    Log "WARN 空闲空间 ${free:0.0} GB < 50GB（ISO解压+集成+重封装峰值 30-50GB），可能不够"
+    Log "WARN 空闲空间 $freeTxt GB < 50GB（ISO解压+集成+重封装峰值 30-50GB），可能不够"
 } else {
-    Log "磁盘空闲 ${free:0.0} GB OK"
+    Log "磁盘空闲 $freeTxt GB OK"
 }
 
 # baseline ISO 分块已重组？

@@ -14,8 +14,9 @@ param(
     [Parameter(Mandatory)] [string] $BranchId
 )
 $ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}   # 见 00.Precheck.ps1：输出编码钉死 UTF-8
 $log = Join-Path $WorkDir "logs\02-fetch-meta4.log"
-function Log($m){ "$(Get-Date -Format 'HH:mm:ss') $m" | Tee-Object -FilePath $log -Append }
+function Log($m){ $s = "$(Get-Date -Format 'HH:mm:ss') $m"; Write-Host $s; [System.IO.File]::AppendAllText($log, $s + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false))) }
 
 # ---- 选 aria2c（与 Start.cmd 一致：amd64 主机优先 bin\bin64） ----
 $aria2 = Join-Path $WorkDir 'bin\bin64\aria2c.exe'
