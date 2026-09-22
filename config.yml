@@ -198,9 +198,11 @@ optimize:
     # —— 共享运行库（多个组件 / 程序共用，首次开机静默装到系统目录）——
     vc14_x64:       https://aka.ms/vs/17/release/vc_redist.x64.exe     # VC++ 2015-2022 x64（MPC-BE 等 C++ 程序共用）
     vc14_x86:       https://aka.ms/vs/17/release/vc_redist.x86.exe     # VC++ 2015-2022 x86
-    vcredist_x64:   https://download.microsoft.com/download/1/6/5/165255E7-1014-4D0A-B094-B6A430A6B958/vcredist_x64.exe  # VC++ 2010 x64（老组件 / 老游戏）
-    vcredist_x86:   https://download.microsoft.com/download/1/6/5/165255E7-1014-4D0A-B094-B6A430A6B958/vcredist_x86.exe  # VC++ 2010 x86
-    dxruntime:      https://download.microsoft.com/download/6/5/B/65B16A3D-6D7F-4C2D-BC0C-9B8B1A9C0E8E/directx_Jun2010_redist.exe  # DirectX 最终用户运行时（Jun2010，补老游戏 D3DX9 / XInput / XAudio 等）
+    # 注：微软原 download.microsoft.com 下载中心已整体退役（2026 实测 404）。以下 VC++2010 / DirectX
+    #     改走 Internet Archive 存档的官方原版二进制（字节级即微软发布件，权威可信）。
+    vcredist_x64:   https://archive.org/download/vcredist_2010/vcredist_x64.exe  # VC++ 2010 x64（老组件 / 老游戏；IA 存档官方原版）
+    vcredist_x86:   https://archive.org/download/vcredist_2010/vcredist_x86.exe  # VC++ 2010 x86（IA 存档官方原版）
+    dxruntime:      https://archive.org/download/directx_Jun2010_redist.exe/directx_Jun2010_redist.exe  # DirectX 最终用户运行时（Jun2010，补老游戏 D3DX9 / XInput / XAudio；IA 存档）
     dotnet9_desktop: https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/9.0.18/windowsdesktop-runtime-9.0.18-win-x64.exe  # .NET 9 Desktop Runtime（含 .NET Runtime，WPF/WinForms 程序）
     # —— 桌面应用安装器 ——
     mpcbe:    https://github.com/Aleksoid1978/MPC-BE/releases/download/1.9.1/MPC-BE.1.9.1.x64-installer.zip   # MPC-BE 播放器
