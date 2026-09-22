@@ -46,7 +46,13 @@ Log "已挂载 install.wim -> $mount（$($recs.Count) 个应用）"
 foreach ($rec in $recs) {
     $main = Abs (@($rec.main)[0])
     if (-not (Test-Path $main)) { throw "apps 载荷缺失: $main（抓取步骤没跑或失败）" }
-    $dargs = @('/Image:' + $mount, '/Add-ProvisionedAppxPackage', '/PackagePath:' + $main)
+    # [坑·致命] PowerShell 里逗号(,)优先级高于加号(+)，`@('/Image:' + $mount, 'B', '/C:' + $main)`
+    #   会被解析成 `@('/Image:' + ($mount,'B','/C:') + $main)` —— 三元组先成数组、再被字符串 +
+    #   拼接成 **一个** 元素（数组转字符串用空格连接）：
+    #     count=1 -> "/Image:D:\...\mount /Add-ProvisionedAppxPackage /PackagePath:D:\...xxx.msixbundle"
+    #   DISM 收到这个畸形单参 -> `Error: 123 Unable to access the image`（19044 实测即死在此）。
+    #   故每个 `+` 表达式必须各自加括号。
+    $dargs = @(('/Image:' + $mount), '/Add-ProvisionedAppxPackage', ('/PackagePath:' + $main))
     $lic = if ($rec.license) { Abs $rec.license } else { $null }
     if ($lic -and (Test-Path $lic)) {
         $dargs += '/LicensePath:' + $lic

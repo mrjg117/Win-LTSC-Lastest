@@ -65,20 +65,29 @@ if ($missing.Count -gt 0) {
 foreach ($name in $groupA) { $forces[$name] = '1' }
 Log "optimize.ini 生效 $(if ($groupA.Count) { $groupA -join ', ' } else { '无' })"
 
-# 3) 逐行改写：只覆盖命中键，其余原样，最后补 ini 里没有的键
+# 3) 逐行改写：只覆盖命中键的「值」，保留原行的分隔写法；其余原样；最后补 ini 里没有的键
+# [坑·致命] W10UI.cmd 读 ini 靠 :ReadINI 里的 `find /i "<键> "` —— 键后**必须跟至少一个空格**
+#   （上游 W10UI.ini 就是 `nosuggapp    =0` 这种「键+空格+=值」写法）。
+#   若把整行压成 `nosuggapp=1`，键后没了空格，find 匹配不到该行 -> 变量保持「未定义」；
+#   而这些键上游**没给默认值**（见 W10UI.cmd 的默认段，只有 Net35…wim2swm 才有），
+#   随后 `if %nosuggapp%==1 (` 就展开成 `if ==1 (` -> cmd 报 `( was unexpected at this time.`
+#   -> 整份 W10UI 直接停摆（26100 实测即死在此：VP9 之后那一行）。
+#   注：有默认值的键（如 UpdtBootFiles）虽不炸，但会被静默重置为默认 0 —— 同样是「以为开了实际没开」。
+#   故只替换「=」之后的值，`键 + 原空格 + =` 原样保留。
 $handled = @{}
 $newLines = foreach ($line in $iniLines) {
-    $m = [regex]::Match($line, '^\s*([^;#][^=]+?)\s*=\s*(.+?)\s*$')
-    if ($m.Success -and $forces.ContainsKey($m.Groups[1].Value.Trim())) {
-        $k = $m.Groups[1].Value.Trim()
+    $m = [regex]::Match($line, '^(\s*([^;#][^=]+?)\s*=)\s*(.*)$')
+    if ($m.Success -and $forces.ContainsKey($m.Groups[2].Value.Trim())) {
+        $k = $m.Groups[2].Value.Trim()
         $handled[$k] = $true
-        "$k=$($forces[$k])"
+        $m.Groups[1].Value + [string]$forces[$k]        # 原前缀（含键后空格 + 等号）+ 新值
     } else {
         $line
     }
 }
 foreach ($k in @($forces.Keys)) {
-    if (-not $handled[$k]) { $newLines += "$k=$($forces[$k])" }
+    # 补键同样必须让键后有一个空格，否则 W10UI 的 `find "<键> "` 依然读不到
+    if (-not $handled[$k]) { $newLines += "$k =$($forces[$k])" }
 }
 # 写回：同一套 latin-1 通道 + 沿用原文件的换行符 —— 未命中行逐字节不变，绝不写 BOM
 [IO.File]::WriteAllBytes($ini, $latin1.GetBytes((@($newLines) -join $nl) + $nl))

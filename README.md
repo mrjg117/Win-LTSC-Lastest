@@ -398,7 +398,15 @@ IoT 相比普通 Enterprise LTSC 的差别：预留存储默认关、BitLocker �
 3. `delta/assets/` → 想注入的驱动 / MAS 工具包 / license.xml / 组件覆盖文件，放进去即生效。
 4. Secrets（仓库 Settings → Secrets，**绝不进仓库文件**）：
    - Release 上传用 Actions 自带的 `GITHUB_TOKEN`，无需配置；
-   - R2 / OneDrive 按需：各自的凭据走 Secrets。
+   - R2 / OneDrive 按需：各自的凭据走 Secrets。**上传已去掉 rclone，改走原生直传**：
+     - R2（S3 直传，curl `--aws-sigv4`，零安装）：
+       `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_ACCOUNT_ID` / `R2_BUCKET` / `R2_REGION`（留空默认 `auto`）
+     - SharePoint（Microsoft Graph 证书鉴权 + 可续传 upload session，零安装，目标=**默认站点/默认文档库**）：
+       `ONEDRIVE_TENANT_ID` / `ONEDRIVE_CLIENT_ID` / `ONEDRIVE_SITE_HOST`（默认站点主机名，形如 `contoso.sharepoint.com`，应用权限 `Files.ReadWrite.All` 或 `Sites.ReadWrite.All`）
+       / `ONEDRIVE_CERT_THUMBPRINT`（证书 SHA1 指纹，十六进制，可选）/ `ONEDRIVE_CERT_KEY`（证书**私钥 PEM** 全文，含换行）
+       - 密钥对：Entra ID 应用注册 → Certificates 上传证书(公钥 .cer)，私钥自己留存填进 `ONEDRIVE_CERT_KEY`；
+         token 用 `client_assertion`(私钥签 JWT) 换，不过期，比 rclone 的 OAuth refresh token 稳。
+       - 上传路径落在默认文档库 `WinLTSC/<tag>/` 下；脚本用 `GET /sites/{host}` 解析默认站点、取其默认 drive。
 5. 首次跑 `Fetch Baseline ISO` 填充 baseline Release，再跑 `Build ISO`。
 
 **加一个优化项** = 在 `config.yml` 的 `optimize.registry`（或 `.ini`）里加一行 —— 代码一行都不用改。

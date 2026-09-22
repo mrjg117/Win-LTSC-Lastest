@@ -24,8 +24,15 @@ if (-not (Test-Path $installWim)) {
     & (Join-Path $WorkDir 'bin\7z.exe') x $baselineIso "-o$tmpExtract" 'sources/install.wim' | Out-Null
 }
 $wimInfo = dism.exe /English /Get-WimInfo /WimFile:$installWim /Index:1 | Out-String
-# Version 形如 10.0.26100 —— build 必须取最后一段，整串 [int] 会抛错
-$ver  = [regex]::Match($wimInfo, 'Version\s*:\s*(\d+\.\d+\.\d+)').Groups[1].Value
+# [坑·致命] dism /Get-WimInfo 的输出**开头会打印 DISM 工具自身版本**（banner：`Version: 10.0.26100.5074`），
+#   镜像版本行在其后（`Version : 10.0.19044`）。二者都能被 `Version\s*:` 匹配到；若取「首个」就把
+#   工具版本当成了镜像 build —— 实测 26100/19044 两个分支都被读成 `10.0.26100`：
+#   26100 恰巧工具=镜像故掩盖了 bug，19044 则被误判成 26100（family 是 19041-19045，直接对不上），
+#   于是 02 按 26100 取了 Win11 的 meta4，把 Win11 补丁灌进 Win10 镜像，DISM 全报 `0x800f081e 不适用`。
+#   故取 **最后一个** 匹配（/Index:1 只输出一个镜像，镜像版本行必然在 banner 之后）。
+#   正则同时容忍 `Image Version:` 与 `Version :` 两种写法。build 取版本串末段，整串 [int] 会抛错。
+$vms  = [regex]::Matches($wimInfo, '(?m)^\s*(?:Image\s+)?Version\s*:\s*(\d+\.\d+\.\d+)')
+$ver  = if ($vms.Count -gt 0) { $vms[$vms.Count - 1].Groups[1].Value } else { '' }
 $arch = [regex]::Match($wimInfo, 'Architecture\s*:\s*(\w+)').Groups[1].Value
 if (-not $ver) { throw "无法从 WIM 识别 Version（DISM 输出异常）" }
 $build = [int]($ver.Split('.')[-1])

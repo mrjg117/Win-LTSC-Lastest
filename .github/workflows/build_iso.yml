@@ -22,7 +22,7 @@ on:
         type: boolean
         default: false
       upload_onedrive:
-        description: "上传到 OneDrive"
+        description: "上传到 SharePoint（默认站点默认文档库）"
         type: boolean
         default: false
       keep_release:
@@ -34,7 +34,7 @@ on:
         type: number
         default: 1
       keep_onedrive:
-        description: "OneDrive 保留版本数"
+        description: "SharePoint 保留版本数"
         type: number
         default: 2
   repository_dispatch:
@@ -153,6 +153,7 @@ jobs:
         shell: bash
         run: |
           # 载荷落进 src/assets/{redist,apps}，正是 delta 脚本读取的位置
+          export PYTHONUNBUFFERED=1   # 让 python 的 log 即时刷到 Actions 日志，不被缓冲到结束才显示
           python self/tools/fetch-payloads.py --config self/config.json --dest src --branch "${{ matrix.branch }}"
 
       - name: cron 去重（仅每月兜底，本月已构建则跳过）
@@ -209,11 +210,27 @@ jobs:
           Remove-Item chunks, baseline_out.iso -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: 运行 Patch.cmd（A→B→W10UI→E→D）
+        # 上游脚本输出流向稀疏 + 此步最耗时（20~40min），裸跑时 Actions 日志整段空白像卡死。
+        # 这里包一层：输出落盘 + 每 5s 心跳回显最近几行，全程有可见活动，也保留完整日志。
         if: env.SKIP != '1'
-        shell: cmd
+        shell: pwsh
         run: |
-          cd src
-          Patch.cmd ${{ matrix.branch }}
+          $log = "src\patch_console.log"
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = "cmd.exe"
+          $psi.Arguments = "/c cd src && Patch.cmd ${{ matrix.branch }} > $log 2>&1"
+          $psi.UseShellExecute = $false
+          $p = [System.Diagnostics.Process]::Start($psi)
+          Write-Host "Patch.cmd 启动 (PID $($p.Id))"
+          while (-not $p.HasExited) {
+            Start-Sleep -Seconds 5
+            if (Test-Path $log) { Get-Content $log -Tail 8 -ErrorAction SilentlyContinue | ForEach-Object { "· $_" } }
+            Write-Host "… Patch.cmd 仍在运行 ($([math]::Round((Get-Date).Subtract($p.StartTime).TotalMinutes,1)) min)"
+          }
+          Write-Host "=== Patch.cmd 末 40 行 ==="
+          if (Test-Path $log) { Get-Content $log -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { "· $_" } }
+          if ($p.ExitCode -ne 0) { throw "Patch.cmd 退出码 $($p.ExitCode)" }
+          Write-Host "Patch.cmd 完成 (退出码 0)"
 
       - name: 读取 UBR -> 计算 TAG / ISO_BASE / 生成 Release（manifest/logs）
         if: env.SKIP != '1'
@@ -315,45 +332,43 @@ jobs:
           $assets = (gh api "repos/${{ github.repository }}/releases/tags/$env:TAG" | ConvertFrom-Json).assets | Where-Object { $_.name -like "*.part*" }
           Write-Host "Release 上的 part 资产数：$($assets.Count)"
           if ($assets.Count -lt $expected) { throw "Release 资产缺失：期望 $expected 个 part，实际 $($assets.Count) 个" }
-          # R2 / OneDrive 通道若开启则需保留 ISO；否则删掉释放磁盘
+          # R2 / SharePoint 通道若开启则需保留 ISO；否则删掉释放磁盘
           if ($env:DO_R2 -ne 'true' -and $env:DO_ONEDRIVE -ne 'true') {
             Remove-Item $finalIso -Force
             Write-Host "已删除本地 ISO，释放 $([math]::Round($size/1GB,2)) GB"
           }
 
-      - name: 安装 rclone（R2 / OneDrive 通道）
-        if: (env.DO_R2 == 'true' || env.DO_ONEDRIVE == 'true') && env.SKIP != '1'
-        shell: pwsh
-        run: |
-          Invoke-WebRequest https://downloads.rclone.org/rclone-current-windows-amd64.zip -OutFile rclone.zip
-          Expand-Archive rclone.zip -DestinationPath rclone_bin
-          $rclone = (Get-ChildItem rclone_bin -Recurse -Filter rclone.exe | Select-Object -First 1).DirectoryName
-          echo "$rclone" >> $env:GITHUB_PATH
-
-      - name: 上传 R2（S3 兼容）
+      - name: 上传 R2（S3 直传，curl --aws-sigv4，无 rclone）
         if: env.DO_R2 == 'true' && env.SKIP != '1'
         shell: pwsh
         env:
-          RCLONE_CONFIG_R2_TYPE: s3
-          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
-          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          RCLONE_CONFIG_R2_REGION: auto
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_REGION: ${{ secrets.R2_REGION || 'auto' }}
         run: |
-          rclone copy "src\out\$env:ISO_BASE.iso" "r2:$env:R2_BUCKET/$env:TAG/"
+          . self/tools/cloud-upload.ps1
+          Send-R2Upload -Iso "src\out\$env:ISO_BASE.iso" -Tag $env:TAG `
+            -AccountId $env:R2_ACCOUNT_ID -Bucket $env:R2_BUCKET -Region $env:R2_REGION `
+            -AccessKey $env:R2_ACCESS_KEY_ID -SecretKey $env:R2_SECRET_ACCESS_KEY
 
-      - name: 上传 OneDrive
+      - name: 上传 SharePoint（默认站点/默认文档库，Graph 证书直传 upload session，无 rclone）
         if: env.DO_ONEDRIVE == 'true' && env.SKIP != '1'
         shell: pwsh
         env:
-          ONEDRIVE_RCLONE_CONF_B64: ${{ secrets.ONEDRIVE_RCLONE_CONF }}
+          OD_TENANT_ID: ${{ secrets.ONEDRIVE_TENANT_ID }}
+          OD_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
+          OD_CERT_THUMBPRINT: ${{ secrets.ONEDRIVE_CERT_THUMBPRINT }}
+          OD_CERT_KEY: ${{ secrets.ONEDRIVE_CERT_KEY }}
+          OD_SITE_HOST: ${{ secrets.ONEDRIVE_SITE_HOST }}
         run: |
-          $dir = "$env:USERPROFILE\.config\rclone"
-          New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          [IO.File]::WriteAllBytes("$dir\rclone.conf", [Convert]::FromBase64String($env:ONEDRIVE_RCLONE_CONF_B64))
-          rclone copy "src\out\$env:ISO_BASE.iso" "onedrive:WinLTSC/$env:TAG/"
+          $keyPath = "$env:RUNNER_TEMP\onedrive_key.pem"
+          Set-Content -Path $keyPath -Value $env:OD_CERT_KEY -NoNewline
+          . self/tools/cloud-upload.ps1
+          Send-SharePointUpload -Iso "src\out\$env:ISO_BASE.iso" -Tag $env:TAG `
+            -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
+            -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -SiteHost $env:OD_SITE_HOST
 
       - name: prune Release（保留 KEEP_RELEASE 个）
         if: env.DO_RELEASE == 'true'
@@ -376,36 +391,35 @@ jobs:
             Write-Host "pruned release $t"
           }
 
-      - name: prune R2（保留 KEEP_R2 个）
+      - name: prune R2（保留 KEEP_R2 个，无 rclone）
         if: env.DO_R2 == 'true'
         shell: pwsh
         env:
-          RCLONE_CONFIG_R2_TYPE: s3
-          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
-          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          RCLONE_CONFIG_R2_REGION: auto
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_REGION: ${{ secrets.R2_REGION || 'auto' }}
           KEEP: ${{ env.KEEP_R2 }}
         run: |
-          $keep = [int]$env:KEEP
-          $edition = $env:EDITION
-          $dirs = @(rclone lsd "r2:$env:R2_BUCKET" | ForEach-Object { ($_ -split '\s+')[-1] } | Where-Object { $_ -like "*-$edition" } | Sort-Object -Descending)
-          $old = @($dirs | Select-Object -Skip $keep)
-          foreach ($d in $old) { rclone purge "r2:$env:R2_BUCKET/$d"; Write-Host "pruned r2 $d" }
+          . self/tools/cloud-upload.ps1
+          Invoke-R2Prune -AccountId $env:R2_ACCOUNT_ID -Bucket $env:R2_BUCKET -Region $env:R2_REGION `
+            -AccessKey $env:R2_ACCESS_KEY_ID -SecretKey $env:R2_SECRET_ACCESS_KEY -Keep ([int]$env:KEEP) -Edition $env:EDITION
 
-      - name: prune OneDrive（保留 KEEP_ONEDRIVE 个）
+      - name: prune SharePoint（保留 KEEP_ONEDRIVE 个，无 rclone）
         if: env.DO_ONEDRIVE == 'true'
         shell: pwsh
         env:
-          ONEDRIVE_RCLONE_CONF_B64: ${{ secrets.ONEDRIVE_RCLONE_CONF }}
+          OD_TENANT_ID: ${{ secrets.ONEDRIVE_TENANT_ID }}
+          OD_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
+          OD_CERT_THUMBPRINT: ${{ secrets.ONEDRIVE_CERT_THUMBPRINT }}
+          OD_CERT_KEY: ${{ secrets.ONEDRIVE_CERT_KEY }}
+          OD_SITE_HOST: ${{ secrets.ONEDRIVE_SITE_HOST }}
           KEEP: ${{ env.KEEP_ONEDRIVE }}
         run: |
-          $dir = "$env:USERPROFILE\.config\rclone"
-          [IO.File]::WriteAllBytes("$dir\rclone.conf", [Convert]::FromBase64String($env:ONEDRIVE_RCLONE_CONF_B64))
-          $keep = [int]$env:KEEP
-          $edition = $env:EDITION
-          $dirs = @(rclone lsd "onedrive:WinLTSC" | ForEach-Object { ($_ -split '\s+')[-1] } | Where-Object { $_ -like "*-$edition" } | Sort-Object -Descending)
-          $old = @($dirs | Select-Object -Skip $keep)
-          foreach ($d in $old) { rclone purge "onedrive:WinLTSC/$d"; Write-Host "pruned onedrive $d" }
+          $keyPath = "$env:RUNNER_TEMP\onedrive_key.pem"
+          Set-Content -Path $keyPath -Value $env:OD_CERT_KEY -NoNewline
+          . self/tools/cloud-upload.ps1
+          Invoke-SharePointPrune -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
+            -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -SiteHost $env:OD_SITE_HOST `
+            -Keep ([int]$env:KEEP) -Edition $env:EDITION
