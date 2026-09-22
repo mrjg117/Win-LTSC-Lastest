@@ -254,8 +254,39 @@ jobs:
           Write-Host "Patch.cmd 启动 (PID $($p.Id), cwd=$wd, 分支=$env:BRANCH)"
           Write-Host "命令窗内容跟随: $patchlog（Patch.cmd 自身零重定向，全部原样落这里）"
 
-          $reader = $null
-          $lines  = 0
+          $reader  = $null
+          $lines   = 0
+          $pending = ""                       # 尚未以 \n 结束的尾巴（原地刷新的进度条会落在这里）
+          $progLast = $null                   # 最近一条「进度条」，只保留最后一条
+          $chunk   = New-Object char[] 65536
+          $esc     = [string][char]27
+          # 进度条判定：`[==== 55.0% ====]` / `[=== 96.5%====]` 这类，不管等号在左还是在右。
+          function Test-ProgressLine([string]$s) {
+            return ($s -match '^\s*\[[=*\s]*\d{1,3}(\.\d+)?%[=*\s]*\]\s*$')
+          }
+          # 把 pending 里「已完整」的行打出去。三条规则：
+          #  1) 按 \n 切；行内残留的 \r 视为**终端行内覆盖**，只留最后一段（DISM 会用 CR 原地重写）。
+          #  2) 纯进度条行**不逐条刷屏**，只记住最后一条；等下一条真实输出到来时补打一次，
+          #     其余时间由心跳里的「当前: …」实时呈现 —— 这正是真机命令窗的语义（屏幕上永远只有一条进度）。
+          #  3) 顺带剥掉 ANSI 转义序列。
+          # 为什么必须这么干：CI #24 的「累计 6350 行」里 98% 是 DISM 每 1% 一行的进度条，
+          # 真正的输出（W10UI 阶段名、msu 清单、报错）被彻底淹没，看起来像"卡住不动"。
+          function Flush-Lines {
+            while (($i = $script:pending.IndexOf("`n")) -ge 0) {
+              $line = $script:pending.Substring(0, $i)
+              $script:pending = $script:pending.Substring($i + 1)
+              $line = ($line.TrimEnd("`r")) -replace ($esc + "\[[0-9;?]*[A-Za-z]"), ""
+              if ($line.IndexOf("`r") -ge 0) { $line = ($line -split "`r")[-1] }
+              if ($line.Trim().Length -eq 0) { continue }
+              if (Test-ProgressLine $line) { $script:progLast = $line.Trim(); continue }
+              if ($script:progLast) { Write-Host ("  " + $script:progLast); $script:lines++; $script:progLast = $null }
+              Write-Host $line
+              $script:lines++
+            }
+            if ($script:pending.Length -gt 4000) {   # 只刷进度条、长时间不换行时别让它无限膨胀
+              $script:pending = $script:pending.Substring($script:pending.Length - 4000)
+            }
+          }
           try {
             while (-not $p.HasExited) {
               Start-Sleep -Seconds 5
@@ -268,16 +299,40 @@ jobs:
                 } catch { $reader = $null }
               }
               if ($reader) {
-                while ($true) {
-                  $ln = $reader.ReadLine()
-                  if ($null -eq $ln) { break }
-                  Write-Host $ln
-                  $lines++
+                while (($n = $reader.Read($chunk, 0, $chunk.Length)) -gt 0) {
+                  $pending += (-join $chunk[0..($n - 1)])
                 }
+                Flush-Lines
               }
-              Write-Host "… Patch.cmd 仍在运行 ($([math]::Round((Get-Date).Subtract($p.StartTime).TotalMinutes,1)) min, 累计输出 $lines 行)"
+              # 心跳：即使上游只在原地刷进度条（长时间没有换行），也把「当前那一行」打出来 ——
+              # 那正是真机命令窗此刻显示的内容。
+              $hb = "… Patch.cmd 仍在运行 ($([math]::Round((Get-Date).Subtract($p.StartTime).TotalMinutes,1)) min, 累计输出 $lines 行)"
+              $cur = ""
+              if ($progLast) { $cur = $progLast }
+              else {
+                # 必须先 TrimEnd 掉结尾的 CR/LF：进度条是 `[=== 55%]` + CR，
+                # 直接取 `-split "\r"` 的最后一段会拿到空串（本地实测踩到）。
+                $tail = $pending.TrimEnd("`r", "`n").Trim()
+                if ($tail) { $cur = (($tail -split "`r")[-1]).Trim() }
+              }
+              if ($cur.Length -gt 180) { $cur = "…" + $cur.Substring($cur.Length - 180) }
+              if ($cur) { $hb += " | 当前: $cur" }
+              Write-Host $hb
             }
           } finally { if ($reader) { $reader.Dispose() } }
+
+          # 进程可能在上一次 5s 轮询之内就结束了：退出后把剩余缓冲收尾读完
+          if ($reader) {
+            try {
+              while (($n = $reader.Read($chunk, 0, $chunk.Length)) -gt 0) { $pending += (-join $chunk[0..($n - 1)]) }
+            } catch {}
+          }
+          Flush-Lines
+          if ($progLast) { Write-Host ("  " + $progLast); $lines++; $progLast = $null }
+          if ($pending.Trim().Length -gt 0) {
+            $cur = (($pending.TrimEnd("`r", "`n") -split "`r")[-1]).Trim()
+            if ($cur) { Write-Host $cur; $lines++ }
+          }
 
           $mins = [math]::Round((Get-Date).Subtract($p.StartTime).TotalMinutes, 1)
           Write-Host "=== Patch.cmd 已退出（退出码 $($p.ExitCode)，耗时 $mins min，累计输出 $lines 行）==="

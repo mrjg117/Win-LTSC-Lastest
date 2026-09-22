@@ -64,12 +64,32 @@ foreach ($rec in $recs) {
     }
     $deps = @(@($rec.deps) | ForEach-Object { Abs $_ } | Where-Object { Test-Path $_ })
     if ($deps.Count -gt 0) {
-        $dargs += '/DependencyPackagePath:' + ($deps -join ',')
-        Log "$($rec.key): 依赖 $($deps.Count) 个"
+        # [坑·致命] /DependencyPackagePath 必须**每个依赖一个开关**。微软官方语法与示例都是重复开关：
+        #     Dism /Online /Add-ProvisionedAppxPackage /PackagePath:Main.appx
+        #       /DependencyPackagePath:...\Framework-x86.appx /DependencyPackagePath:...\Framework-x64.appx
+        #   写成 `'/DependencyPackagePath:' + ($deps -join ',')` 只会得到**一个**参数，形如
+        #     /DependencyPackagePath:D:\...\a.appx,D:\...\b.appx
+        #   DISM 不认逗号分隔，把整串当成**单个路径**，其中第二个驱动器冒号让「文件名」非法 ->
+        #     Error: 123  The filename, directory name, or volume label syntax is incorrect.
+        #   （CI #24 实测即死在此：7 个依赖 -> 123；DISM 已打印 Image Version 说明镜像访问正常，
+        #     失败发生在参数解析，不是镜像/挂载问题。）
+        foreach ($d in $deps) { $dargs += ('/DependencyPackagePath:' + $d) }
+        Log "$($rec.key): 依赖 $($deps.Count) 个（逐个 /DependencyPackagePath 开关）"
     }
     Log "provision $($rec.key) <- $(Split-Path $main -Leaf)"
+    # 打印实际命令行：失败时它随末 25 行进 annotation，**无需登录即可复核参数**（这次 123 就是靠这条路定位的）
+    Log ("DISM 参数: " + ($dargs -join ' '))
     dism.exe /English @dargs
-    if ($LASTEXITCODE -ne 0) { Log "FAIL provision $($rec.key)（DISM 退出码 $LASTEXITCODE）"; throw "应用预置失败: $($rec.key)" }
+    if ($LASTEXITCODE -ne 0) {
+        Log "FAIL provision $($rec.key)（DISM 退出码 $LASTEXITCODE）"
+        # DISM 在屏幕上只回一句 `Error: 123`，真正的原因在它自己的日志里。失败时把尾部带出来 ——
+        # 它会随 logs\Patch.log 的末 25 行进 GitHub annotation，**无需登录即可看到根因**。
+        $dismLog = Join-Path $env:windir 'Logs\DISM\dism.log'
+        if (Test-Path $dismLog) {
+            Get-Content $dismLog -Tail 30 -ErrorAction SilentlyContinue | ForEach-Object { Log ("  DISM| " + $_) }
+        }
+        throw "应用预置失败: $($rec.key)"
+    }
     Log "OK $($rec.key)"
 }
 Dismount-WindowsImage -Path $mount -Save | Out-Null

@@ -200,10 +200,15 @@ def rg_list(product_id):
             # 它们无法用于 DISM 离线预置（媒体播放器那种产品 ID 会同时给出加密与明文两份）。
             continue
         if "_arm_" in low or "_arm64_" in low or low.endswith("_arm64"):
+            # Arm 包在 x64 目标上 DISM 会直接忽略（官方：If the Arm dependency package is also
+            # specified or included, DISM will ignore it）—— 所以只丢 Arm，**不能丢 x86**。
             continue
-        if "_x86_" in low:
-            # 目标映像是 x64，DISM 预置只认匹配架构的依赖包；x86 那份纯属白下
-            continue
+        # [不要丢 x86] 官方文档：x64 目标映像上，架构相关的依赖必须把 **x86 与 x64 都给**
+        #   （"on an x64 target image, include a path to both the x86 and x64 dependency packages"）。
+        #   故 x86 包必须保留 —— 它只会作为**依赖**被选中：主包由 classify() 之后的
+        #   is_x64_or_neutral 排序决定，x64/neutral 永远优先，x86 主包排在末尾不会被取。
+        #   （历史上这里直接 continue 丢弃 x86，与官方要求冲突，会让 /Add-ProvisionedAppxPackage
+        #     缺 x86 依赖。）
         nbytes = 0
         msz = re.match(r"([\d.]+)\s*(KB|MB|GB)", size.strip(), re.I)
         if msz:
