@@ -35,7 +35,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $WorkDir,
-    [Parameter(Mandatory)] [string] $BranchId
+    [Parameter(Mandatory)] [string] $BranchId,
+    # 由 08.Image-Session 传入：非空 = 复用外部那一次挂载（本脚本不挂也不卸）
+    [string] $MountDir
 )
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}   # 见 00.Precheck.ps1：输出编码钉死 UTF-8
@@ -198,23 +200,34 @@ $($items -join "`r`n")
 }
 
 $cfg = Get-Content (Join-Path $WorkDir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-$mount = Join-Path $WorkDir 'mount'
+$ownsMount = -not $MountDir
+$mount = if ($MountDir) { $MountDir } else { Join-Path $WorkDir 'mount' }
 $installWim = Join-Path $WorkDir 'ISO\sources\install.wim'
 
+# hive 表同时记两种写法，绝不在用到时现场拼：
+#   key = reg.exe 形式（reg load / reg add 用）
+#   ps  = PowerShell provider 形式（Get-ChildItem 等用）
+# [坑·致命·#26 实测] 曾写成 Get-ChildItem "HKLM:\$($e.key)" —— 展开是
+#   HKLM:\HKLM\LTSC_SYS（多一层 HKLM），枚举不到任何 ControlSetNNN，
+#   于是 {CS} 类写入（电源/快速启动/BitLocker）全部 throw，两条分支都死在这里。
 $HIVES = @{
-    SYSTEM   = @{ file = Join-Path $mount 'Windows\System32\config\SYSTEM';   key = 'HKLM\LTSC_SYS' }
-    SOFTWARE = @{ file = Join-Path $mount 'Windows\System32\config\SOFTWARE'; key = 'HKLM\LTSC_SW'  }
-    DEFAULT  = @{ file = Join-Path $mount 'Users\Default\NTUSER.DAT';          key = 'HKLM\LTSC_DEF' }
+    SYSTEM   = @{ file = Join-Path $mount 'Windows\System32\config\SYSTEM';   key = 'HKLM\LTSC_SYS'; ps = 'HKLM:\LTSC_SYS' }
+    SOFTWARE = @{ file = Join-Path $mount 'Windows\System32\config\SOFTWARE'; key = 'HKLM\LTSC_SW';  ps = 'HKLM:\LTSC_SW'  }
+    DEFAULT  = @{ file = Join-Path $mount 'Users\Default\NTUSER.DAT';          key = 'HKLM\LTSC_DEF'; ps = 'HKLM:\LTSC_DEF' }
 }
 
-if (Test-Path $mount) {
-    # [坑] 目录存在 ≠ 仍是挂载点；对非挂载点 Dismount 会抛终止性 COMException
-    try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
-    catch { Log "WARN 残留挂载点清理跳过（非挂载点）: $($_.Exception.Message)" }
+if ($ownsMount) {
+    if (Test-Path $mount) {
+        # [坑] 目录存在 ≠ 仍是挂载点；对非挂载点 Dismount 会抛终止性 COMException
+        try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
+        catch { Log "WARN 残留挂载点清理跳过（非挂载点）: $($_.Exception.Message)" }
+    }
+    New-Item -ItemType Directory -Force -Path $mount | Out-Null
+    Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
+    Log "已挂载 install.wim -> $mount"
+} else {
+    Log "复用 08 会话的挂载: $mount"
 }
-New-Item -ItemType Directory -Force -Path $mount | Out-Null
-Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
-Log "已挂载 install.wim -> $mount"
 
 try {
     # ---------- 1) Set-Edition：转到目标 SKU（本轮目标 = IoT Enterprise LTSC） ----------
@@ -274,7 +287,7 @@ try {
                 $e = $HIVES[$m.hive]
                 $paths = @()
                 if ($m.path -like '*{CS}*') {
-                    $cs = @(Get-ChildItem "HKLM:\$($e.key)" -ErrorAction SilentlyContinue |
+                    $cs = @(Get-ChildItem $e.ps -ErrorAction SilentlyContinue |
                             ForEach-Object { $_.PSChildName } | Where-Object { $_ -match '^ControlSet\d+$' })
                     if ($cs.Count -eq 0) { throw "hive $($m.hive) 里找不到 ControlSetNNN，无法写入 $($m.path)" }
                     foreach ($c in $cs) { $paths += ($m.path -replace '\{CS\}', $c) }
@@ -469,10 +482,15 @@ pause
     [IO.File]::WriteAllText((Join-Path $panther 'unattend.xml'), $merged, (New-Object Text.UTF8Encoding($false)))
     Log "烤入 unattend.xml -> $panther（XML 校验通过）"
 
-    Dismount-WindowsImage -Path $mount -Save | Out-Null
-    Log "== 镜像烤入完成 =="
+    if ($ownsMount) {
+        Dismount-WindowsImage -Path $mount -Save | Out-Null
+        Log "== 镜像烤入完成（本步自行卸载保存）=="
+    } else {
+        Log "== 镜像烤入完成（挂载由 08 会话统一收尾）=="
+    }
 } catch {
     Log "FAIL $($_.Exception.Message)"
-    try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null } catch { }
+    # 只卸自己挂的那次；会话模式下把 Discard 留给 08（它知道整条链的成败，能一次决定丢还是存）
+    if ($ownsMount) { try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null } catch { } }
     throw
 }

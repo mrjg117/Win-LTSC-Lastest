@@ -14,7 +14,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $WorkDir,
-    [Parameter(Mandatory)] [string] $BranchId
+    [Parameter(Mandatory)] [string] $BranchId,
+    # 由 08.Image-Session 传入：非空 = 复用外部那一次挂载（本脚本不挂也不卸）
+    [string] $MountDir
 )
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}   # 见 00.Precheck.ps1：输出编码钉死 UTF-8
@@ -33,16 +35,21 @@ if ($recs.Count -eq 0) { Log "分支 $BranchId 的 apps 清单为空 -> 跳过";
 # manifest 里的路径以 WorkDir 为根；统一转绝对路径
 function Abs([string] $rel) { Join-Path $WorkDir ($rel -replace '/', '\') }
 
-$mount = Join-Path $WorkDir 'mount'
+$ownsMount = -not $MountDir
+$mount = if ($MountDir) { $MountDir } else { Join-Path $WorkDir 'mount' }
 $installWim = Join-Path $WorkDir 'ISO\sources\install.wim'
-if (Test-Path $mount) {
-    # [坑] 目录存在 ≠ 仍是挂载点；对非挂载点 Dismount 会抛终止性 COMException
-    try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
-    catch { Log "WARN 残留挂载点清理跳过（非挂载点）: $($_.Exception.Message)" }
+if ($ownsMount) {
+    if (Test-Path $mount) {
+        # [坑] 目录存在 ≠ 仍是挂载点；对非挂载点 Dismount 会抛终止性 COMException
+        try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
+        catch { Log "WARN 残留挂载点清理跳过（非挂载点）: $($_.Exception.Message)" }
+    }
+    New-Item -ItemType Directory -Force -Path $mount | Out-Null
+    Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
+    Log "已挂载 install.wim -> $mount（$($recs.Count) 个应用）"
+} else {
+    Log "复用 08 会话的挂载: $mount（$($recs.Count) 个应用）"
 }
-New-Item -ItemType Directory -Force -Path $mount | Out-Null
-Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
-Log "已挂载 install.wim -> $mount（$($recs.Count) 个应用）"
 
 foreach ($rec in $recs) {
     $main = Abs (@($rec.main)[0])
@@ -92,5 +99,9 @@ foreach ($rec in $recs) {
     }
     Log "OK $($rec.key)"
 }
-Dismount-WindowsImage -Path $mount -Save | Out-Null
-Log "== 应用预置完成 =="
+if ($ownsMount) {
+    Dismount-WindowsImage -Path $mount -Save | Out-Null
+    Log "== 应用预置完成（本步自行卸载保存）=="
+} else {
+    Log "== 应用预置完成（挂载由 08 会话统一收尾）=="
+}

@@ -5,7 +5,7 @@
              名字形态自动分流；不匹配任何形态即失败（不静默跳过）：
                含 ~~~~           -> /Remove-Capability
                以 -Package 结尾   -> /Remove-Package
-               其余              -> /Disable-WindowsOptionalFeature
+               其余              -> /Disable-Feature
    [注意] 名字需用真机 Get-WindowsCapability / Get-WindowsPackage 校准；
           不存在、或已被累积更新取代的项记 SKIP 而不是 WARN ——
           微软官方 Removable Packages 一旦被后续 LCU 取代就再也无法移除（CBS 报错），
@@ -14,7 +14,9 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $WorkDir,
-    [Parameter(Mandatory)] [string] $BranchId
+    [Parameter(Mandatory)] [string] $BranchId,
+    # 由 08.Image-Session 传入：非空 = 复用外部那一次挂载（本脚本不挂也不卸）
+    [string] $MountDir
 )
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}   # 见 00.Precheck.ps1：输出编码钉死 UTF-8
@@ -36,16 +38,21 @@ function Form([string] $n) {
     return 'feature'
 }
 
-$mount = Join-Path $WorkDir 'mount'
+$ownsMount = -not $MountDir
+$mount = if ($MountDir) { $MountDir } else { Join-Path $WorkDir 'mount' }
 $installWim = Join-Path $WorkDir 'ISO\sources\install.wim'
-if (Test-Path $mount) {
-    # [坑] 目录存在 ≠ 仍是挂载点；对非挂载点 Dismount 会抛终止性 COMException
-    try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
-    catch { Log "WARN 残留挂载点清理跳过（非挂载点）: $($_.Exception.Message)" }
+if ($ownsMount) {
+    if (Test-Path $mount) {
+        # [坑] 目录存在 ≠ 仍是挂载点；对非挂载点 Dismount 会抛终止性 COMException
+        try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
+        catch { Log "WARN 残留挂载点清理跳过（非挂载点）: $($_.Exception.Message)" }
+    }
+    New-Item -ItemType Directory -Force -Path $mount | Out-Null
+    Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
+    Log "已挂载 install.wim -> $mount"
+} else {
+    Log "复用 08 会话的挂载: $mount"
 }
-New-Item -ItemType Directory -Force -Path $mount | Out-Null
-Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
-Log "已挂载 install.wim -> $mount"
 
 # 只枚举一次（每次 -Path 枚举都要走一遍 wim，开销不小）
 $caps = @(); $pkgs = @()
@@ -69,10 +76,18 @@ foreach ($n in $names) {
             if ($LASTEXITCODE -ne 0) { Log "WARN Remove-Package 失败: $n" } else { $rcPkg++ }
         }
         'feature' {
-            dism.exe /Image:$mount /Disable-WindowsOptionalFeature /FeatureName:$n /Remove
+            # [坑·实测] 离线映像的选项名是 /Disable-Feature，不是 /Disable-WindowsOptionalFeature
+            #   （后者报 Error 87: the disable-windowsoptionalfeature option is unknown ——
+            #    19044 实测：MicrosoftWindowsPowerShellV2 / V2Root 两条都栽在这里，被静默 WARN 掉，
+            #    于是"写了要卸的项其实没卸"）。与上面 /Remove-Capability 属同一类坑。
+            dism.exe /Image:$mount /Disable-Feature /FeatureName:$n /Remove
             if ($LASTEXITCODE -ne 0) { Log "WARN Disable-Feature 失败: $n" } else { $rcFeat++ }
         }
     }
 }
-Dismount-WindowsImage -Path $mount -Save | Out-Null
-Log "== 组件精简完成: capability $rcCap / package $rcPkg / feature $rcFeat，跳过 $skipped =="
+if ($ownsMount) {
+    Dismount-WindowsImage -Path $mount -Save | Out-Null
+    Log "== 组件精简完成: capability $rcCap / package $rcPkg / feature $rcFeat，跳过 $skipped（本步自行卸载保存）=="
+} else {
+    Log "== 组件精简完成: capability $rcCap / package $rcPkg / feature $rcFeat，跳过 $skipped（挂载由 08 会话统一收尾）=="
+}

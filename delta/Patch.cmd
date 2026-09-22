@@ -1,6 +1,6 @@
 ﻿@echo off
 REM ============================================================================
-REM Patch.cmd - 总入口（管理员权限 + 编排 A→B→W10UI→E→D）
+REM Patch.cmd - 总入口（管理员权限 + 编排 A→B→W10UI→E(单次挂载会话)→转ESD→D）
 REM   构建时本文件与 lib/*.ps1、assets、config 已整目录拷进上游快照 ./src
 REM   调用：Patch.cmd <branchId>   例：Patch.cmd 26100
 REM
@@ -98,29 +98,20 @@ REM 2) patch\ 里的补丁包已集成进 install.wim，不再需要
 del /f /q *.iso
 if exist "patch" rmdir /s /q "patch"
 
-REM ---- 03 驱动注入 ----
-echo [%date% %time%] [03] Integrate-Drivers
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\03.Integrate-Drivers.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%"
+REM ---- 08 单次挂载会话（03 驱动 → 04 应用 → 05 精简 → 06 断言 → 07 烤入） ----
+REM [为什么合并] 这五步都在 W10UI 之后、都是对同一个 install.wim 的改动。原先各自挂载/卸载，
+REM   而每一次 Dismount -Save 都要把整个镜像重新 LZX 压缩一遍（实测单次数分钟，纯重复开销）。
+REM   合并后整条链只挂一次、只存一次；各步逻辑与日志仍各自独立（logs\0X-*.log），
+REM   任何一步失败即整体 Discard 卸载（镜像保持改动前状态，不留半成品）。
+echo [%date% %time%] [08] Image-Session（单次挂载内完成 03-07）
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\08.Image-Session.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%"
 if errorlevel 1 goto :fail
 
-REM ---- 04 应用预置（按 config.yml 的 apps 清单） ----
-echo [%date% %time%] [04] Integrate-Apps
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\04.Integrate-Apps.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%"
-if errorlevel 1 goto :fail
-
-REM ---- 05 组件精简（按 config.yml 的 remove 清单） ----
-echo [%date% %time%] [05] Patch-Components
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\05.Patch-Components.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%"
-if errorlevel 1 goto :fail
-
-REM ---- 06 断言（失败即中止，不留半成品） ----
-echo [%date% %time%] [06] Assert-UBR
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\06.Assert-UBR.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%"
-if errorlevel 1 goto :fail
-
-REM ---- 07 烤入镜像（SKU 转 IoT + 离线优化注入 + 应答 + C:\Tools） ----
-echo [%date% %time%] [07] Bake-Image
-powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\07.Bake-Image.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%"
+REM ---- 09 转 ESD（最后一步：wim -> esd，LZMS 压缩，成品更小） ----
+REM [为何必须在最后] ESD 只读，DISM 挂不上（这正是 W10UI.ini 的 wim2esd 红线保持 0 的原因），
+REM   所以只能在 08 会话（最后一次挂载）之后、oscdimg 封装之前做这一次转换。
+echo [%date% %time%] [09] Convert-ESD
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\09.Convert-Esd.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%"
 if errorlevel 1 goto :fail
 
 REM ---- 封装最终 ISO ----

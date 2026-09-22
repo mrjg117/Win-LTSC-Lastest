@@ -31,18 +31,20 @@
 │       └── merge.cmd                  发给下载者的重组工具：与全部分片放同一目录，双击即重组 + 校验
 │
 ├── delta/                             叠加层（构建时整目录拷进上游快照）
-│   ├── Patch.cmd                      总入口：管理员校验 + 顺序编排（00 → 99 → W10UI → 01…07）
-│   ├── win10ui-override.ini           不随配置变的红线值（wim2esd=0 / ResetBase=0），99 写回上游 ini
+│   ├── Patch.cmd                      总入口：管理员校验 + 顺序编排（00 → 99 → W10UI → 08 会话 → 09 ESD）
+│   ├── win10ui-override.ini           不随配置变的红线值（wim2esd=0：上游那步必须继续产出 wim），99 写回上游 ini
 │   │
 │   ├── lib/                           构建期各阶段脚本，编号即执行顺序
 │   │   ├── 00.Precheck.ps1                预检 fail-fast：上游文件 / delta 脚本 / config.json / 磁盘
 │   │   ├── 01.Build-Manifest.ps1          读 WIM 的 build·arch + 分支定义 → manifest.json
 │   │   ├── 02.Fetch-Updates.ps1           按上游 meta4 下载当月 LCU / SSU 到 patch\
-│   │   ├── 03.Integrate-Drivers.ps1       注入 assets/drivers（放文件就注入）
-│   │   ├── 04.Integrate-Apps.ps1          按 apps 清单离线预置 MSIX
-│   │   ├── 05.Patch-Components.ps1        按 remove 清单精简组件
-│   │   ├── 06.Assert-UBR.ps1              断言 build 落在 family 内，回写实测 UBR
-│   │   ├── 07.Bake-Image.ps1              挂载 WIM：Set-Edition 转 IoT + 离线注入 registry + 应答 + C:\Tools
+│   │   ├── 03.Integrate-Drivers.ps1       注入 assets/drivers（放文件就注入；被 08 调用）
+│   │   ├── 04.Integrate-Apps.ps1          按 apps 清单离线预置 MSIX（被 08 调用）
+│   │   ├── 05.Patch-Components.ps1        按 remove 清单精简组件（被 08 调用）
+│   │   ├── 06.Assert-UBR.ps1              断言 build 落在 family 内，回写实测 UBR（被 08 调用）
+│   │   ├── 07.Bake-Image.ps1              Set-Edition 转 IoT + 离线注入 registry + 应答 + C:\Tools（被 08 调用）
+│   │   ├── 08.Image-Session.ps1           单次挂载会话：挂一次跑完 03→07，全绿才 Save，失败即 Discard
+│   │   ├── 09.Convert-Esd.ps1             最后一步：install.wim → install.esd（wimlib LZMS + solid）
 │   │   └── 99.Force-W10UI-Ini.ps1         把红线值 + optimize.ini 写回上游 W10UI.ini
 │   │
 │   ├── config/
@@ -79,7 +81,7 @@
 | `gvlk` | 映射 | SKU 转换用的 KMS GVLK（微软官方文档值） |
 | `apps` | 列表 | 写一行装一个（12 位 Store 产品 ID 或完整直链）；选包规则见下 |
 | `optimize.ini` | 映射 | `开关名: 一句话说明`；99 把该键在上游 `W10UI.ini` 里置 1 |
-| `optimize.registry` | 映射 | `开关名: "hive\|path\|name\|type\|value"`（或该串的列表）；07 挂载镜像时离线写 hive |
+| `optimize.registry` | 映射 | `开关名: "hive\|path\|name\|type\|value"`（或该串的列表）；08 挂载镜像后由 07 离线写 hive |
 | `optimize.components` | 映射 | `名字: 安装器直链`；构建期抓取 → 07 写进应答，首启静默安装 |
 | `optimize._extensions` | 列表 | `{ext}` 占位符的取值清单（仅当有 registry 项用到 `{ext}` 时才需要写） |
 | `storage` | 映射 | `release` / `r2` / `onedrive`，值 = 保留份数 |
@@ -170,8 +172,10 @@ Windows 侧脚本只读 JSON，因此不需要在 runner 上装 YAML 库。
      从 baseline Release 拉分片 → 重组 → 校验 → 解 ISO
      Patch.cmd 顺序执行：
        00 预检 → 99 写上游 ini → 解 baseline ISO → 01 清单 → 02 下载更新
-       → W10UI 把补丁集成进 install.wim → 03 驱动 → 04 应用 → 05 精简 → 06 断言
-       → 07 挂载 WIM：Set-Edition 转 IoT + 离线注入 registry + 应答 + C:\Tools
+       → W10UI 把补丁集成进 install.wim（上游自己挂 4 次：install 1 + winre 1 + boot 2）
+       → 08 单次挂载会话：一次 mount 内跑完 03 驱动 → 04 应用 → 05 精简 → 06 断言
+         → 07 烤入（Set-Edition 转 IoT + 离线 registry + 应答 + C:\Tools）；成功才 Save，失败即 Discard
+       → 09 转 ESD：install.wim → install.esd（wimlib LZMS + solid，成品更小）
      封装 ISO → RAW 切分 → 上传 Release（可选 R2 / OneDrive）→ 各自 prune
 ```
 
@@ -276,13 +280,13 @@ UBR 用 06 实测值，不猜。
 
 ```
 config.yml ── optimize ──┬── ini        ──▶  99.Force-W10UI-Ini.ps1   （键置 1 写回上游 W10UI.ini）
-                         ├── registry   ──▶  07.Bake-Image.ps1        （挂载镜像时 reg load → 写 → unload）
+                         ├── registry   ──▶  07.Bake-Image.ps1        （08 挂载镜像后 reg load → 写 → unload）
                          ├── components ──▶  07.Bake-Image.ps1        （抓载荷 → 写进应答 → 首启静默装）
                          └── _extensions                     （{ext} 占位符的取值清单，供 registry 展开）
 ```
 
-**代码里不含任何具体优化项**：`07` 只有「挂载 / 加载 hive / 按对象写值 / 展开占位符」四个通用动作，
-加一个优化项 = 往 `config.yml` 加一行，脚本一行都不用改。
+**代码里不含任何具体优化项**：`07` 只有「加载 hive / 按对象写值 / 展开占位符」这些通用动作
+（镜像挂载由 `08.Image-Session.ps1` 统一负责），加一个优化项 = 往 `config.yml` 加一行，脚本一行都不用改。
 
 #### `optimize.ini` —— 上游 `W10UI.ini` 的开关
 
@@ -385,7 +389,7 @@ optimize:
 
 ### 5.5 SKU：构建时转到 IoT Enterprise LTSC
 
-`07.Bake-Image.ps1` 在挂载会话里 `DISM /Set-Edition` 到 `branches.<b>.edition`（密钥取 `gvlk` 表）。
+`07.Bake-Image.ps1` 在 `08.Image-Session.ps1` 的这一次挂载里 `DISM /Set-Edition` 到 `branches.<b>.edition`（密钥取 `gvlk` 表）。
 IoT 相比普通 Enterprise LTSC 的差别：预留存储默认关、BitLocker 自动加密默认关、无 TPM/安全启动/内存硬件要求、
 支持周期 10 年、**支持数字权利激活（普通 LTSC 只有 KMS/MAK）**；代价是 Edge 不可卸载。
 

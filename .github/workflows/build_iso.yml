@@ -249,7 +249,7 @@ jobs:
           Remove-Item chunks, baseline_out.iso -Recurse -Force -ErrorAction SilentlyContinue
           Write-Host ("已清理分块与临时文件，释放 {0:N2} GB" -f ($total / 1GB))
 
-      - name: 运行 Patch.cmd（A→B→W10UI→E→D）
+      - name: 运行 Patch.cmd（A→B→W10UI→单次挂载会话→转 ESD→D）
         # 此步最耗时（20~40min）。目标：**web 日志 = 真机命令窗的内容，一行不多、一行不少**。
         # [机制] Patch.cmd 自身不做任何重定向（本地双击运行时命令窗里是什么就是什么）；
         #   由本步父进程接管 `cmd /c "chcp 65001 & Patch.cmd <branch> > logs\Patch.log 2>&1"`，

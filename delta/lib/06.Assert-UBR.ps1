@@ -12,27 +12,34 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $WorkDir,
-    [Parameter(Mandatory)] [string] $BranchId
+    [Parameter(Mandatory)] [string] $BranchId,
+    # 由 08.Image-Session 传入：非空 = 复用外部那一次挂载（本脚本不挂也不卸）
+    [string] $MountDir
 )
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}   # 见 00.Precheck.ps1：输出编码钉死 UTF-8
 $log = Join-Path $WorkDir "logs\06-assert.log"
 function Log($m){ $s = "$(Get-Date -Format 'HH:mm:ss') $m"; Write-Host $s; [System.IO.File]::AppendAllText($log, $s + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false))) }
 
-$mount = Join-Path $WorkDir 'mount'
+$ownsMount = -not $MountDir
+$mount = if ($MountDir) { $MountDir } else { Join-Path $WorkDir 'mount' }
 $installWim = Join-Path $WorkDir 'ISO\sources\install.wim'
 $manifest = Get-Content (Join-Path $WorkDir 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $targetBuild = [int]$manifest.build
 $family = @(@($manifest.family) | ForEach-Object { [int]$_ })
 if ($family.Count -eq 0) { $family = @($targetBuild) }
 
-if (Test-Path $mount) {
-    # [坑] 目录存在 ≠ 仍是挂载点；对非挂载点 Dismount 会抛终止性 COMException
-    try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
-    catch { Log "WARN 残留挂载点清理跳过（非挂载点）: $($_.Exception.Message)" }
+if ($ownsMount) {
+    if (Test-Path $mount) {
+        # [坑] 目录存在 ≠ 仍是挂载点；对非挂载点 Dismount 会抛终止性 COMException
+        try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
+        catch { Log "WARN 残留挂载点清理跳过（非挂载点）: $($_.Exception.Message)" }
+    }
+    New-Item -ItemType Directory -Force -Path $mount | Out-Null
+    Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
+} else {
+    Log "复用 08 会话的挂载: $mount"
 }
-New-Item -ItemType Directory -Force -Path $mount | Out-Null
-Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
 try {
     $hive = Join-Path $mount 'Windows\System32\config\SOFTWARE'
     & reg.exe load 'HKLM\OFFLINE' $hive | Out-Null
@@ -61,5 +68,6 @@ try {
     Log "== 断言通过: build=$curBuild UBR=$curUBR =="
 } finally {
     & reg.exe unload 'HKLM\OFFLINE' 2>$null | Out-Null
-    Dismount-WindowsImage -Path $mount -Discard | Out-Null
+    # 只卸自己挂的那次；08 会话里这步是只读断言，绝不能 Discard 掉前面 04/05 的改动
+    if ($ownsMount) { Dismount-WindowsImage -Path $mount -Discard | Out-Null }
 }

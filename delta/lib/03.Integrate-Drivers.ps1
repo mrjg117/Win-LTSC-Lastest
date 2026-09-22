@@ -1,5 +1,5 @@
 ﻿<#
-.SYNOPSIS 04 - 驱动注入（留盘，PnP 按需装）
+.SYNOPSIS 03 - 驱动注入（留盘，PnP 按需装）
 .DESCRIPTION install.wim 全量驱动池：DISM /Add-Driver /Recurse 写进 DriverStore，
              部署时 Windows PnP 只安装硬件匹配的驱动，不匹配的只占存储不加载、不冲突。
              boot.wim 索引2（Setup）注入最小集（存储/RAID/NVMe/网卡），使安装器可见磁盘。
@@ -11,14 +11,18 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $WorkDir,
-    [Parameter(Mandatory)] [string] $BranchId
+    [Parameter(Mandatory)] [string] $BranchId,
+    # 由 08.Image-Session 传入：非空 = 复用外部那一次挂载（本脚本不挂也不卸）
+    [string] $MountDir
 )
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch {}   # 见 00.Precheck.ps1：输出编码钉死 UTF-8
-$log = Join-Path $WorkDir "logs\04-drivers.log"
+$log = Join-Path $WorkDir "logs\03-drivers.log"
 function Log($m){ $s = "$(Get-Date -Format 'HH:mm:ss') $m"; Write-Host $s; [System.IO.File]::AppendAllText($log, $s + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false))) }
 
-$mount = Join-Path $WorkDir 'mount'
+# 挂载权归属：$MountDir 为空 = 独立运行（自己挂/自己卸）；非空 = 08 会话内复用同一次挂载
+$ownsMount = -not $MountDir
+$mount = if ($MountDir) { $MountDir } else { Join-Path $WorkDir 'mount' }
 $installWim = Join-Path $WorkDir 'ISO\sources\install.wim'   # [SPIKE] 路径随 W10UI 输出确认
 
 # install.wim 全量驱动池
@@ -27,18 +31,26 @@ $poolInfs = @(Get-ChildItem $pool -Recurse -Filter *.inf -File -ErrorAction Sile
 if ($poolInfs.Count -eq 0) {
     Log "assets\drivers 下无 .inf，跳过 install.wim 驱动池注入（请把官方驱动解压到该目录）"
 } else {
-    if (Test-Path $mount) {
-        # [坑] 目录存在 ≠ 仍是挂载点；对非挂载点 Dismount 会抛终止性 COMException
-        try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
-        catch { Log "WARN 残留挂载点清理跳过（非挂载点）: $($_.Exception.Message)" }
+    if ($ownsMount) {
+        if (Test-Path $mount) {
+            # [坑] 目录存在 ≠ 仍是挂载点；对非挂载点 Dismount 会抛终止性 COMException
+            try { Dismount-WindowsImage -Path $mount -Discard -ErrorAction Stop | Out-Null }
+            catch { Log "WARN 残留挂载点清理跳过（非挂载点）: $($_.Exception.Message)" }
+        }
+        New-Item -ItemType Directory -Force -Path $mount | Out-Null
+        Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
+    } else {
+        Log "复用 08 会话的挂载: $mount"
     }
-    New-Item -ItemType Directory -Force -Path $mount | Out-Null
-    Mount-WindowsImage -ImagePath $installWim -Index 1 -Path $mount | Out-Null
     Log "注入驱动池(全量, 留盘): $pool （$($poolInfs.Count) 个 .inf）"
     dism.exe /English /Image:$mount /Add-Driver /Driver:$pool /Recurse /ForceUnsigned
     if ($LASTEXITCODE -ne 0) { Log "FAIL 驱动注入"; throw "驱动注入失败" }
-    Dismount-WindowsImage -Path $mount -Save | Out-Null
-    Log "install.wim 驱动池注入完成"
+    if ($ownsMount) {
+        Dismount-WindowsImage -Path $mount -Save | Out-Null
+        Log "install.wim 驱动池注入完成（本步自行卸载保存）"
+    } else {
+        Log "install.wim 驱动池注入完成（挂载由 08 会话统一收尾）"
+    }
 }
 
 # boot.wim 最小集
