@@ -212,23 +212,33 @@ jobs:
       - name: 运行 Patch.cmd（A→B→W10UI→E→D）
         # 上游脚本输出流向稀疏 + 此步最耗时（20~40min），裸跑时 Actions 日志整段空白像卡死。
         # 这里包一层：输出落盘 + 每 5s 心跳回显最近几行，全程有可见活动，也保留完整日志。
+        # [坑·实测复现] 重定向路径会按「子进程当前目录」解析：若写 `cd src && ... > src\x.log`，
+        #   cd 之后 `src\` 被再拼一层（= src\src\x.log，目录不存在）→ cmd 直接报
+        #   "The system cannot find the path specified."、退出码 1，Patch.cmd 一个字符都不跑。
+        #   故这里**不 cd**，改用 ProcessStartInfo.WorkingDirectory 指定工作目录，日志用裸文件名。
         if: env.SKIP != '1'
         shell: pwsh
         run: |
           $log = "src\patch_console.log"
+          Remove-Item $log -Force -ErrorAction SilentlyContinue
+          $wd = Join-Path $PWD "src"
+          if (-not (Test-Path $wd)) { throw "找不到上游快照目录: $wd（前面的『套 delta 到上游快照』步是否成功？）" }
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = "cmd.exe"
-          $psi.Arguments = "/c cd src && Patch.cmd ${{ matrix.branch }} > $log 2>&1"
+          $psi.Arguments = "/c Patch.cmd ${{ matrix.branch }} > patch_console.log 2>&1"
           $psi.UseShellExecute = $false
+          $psi.WorkingDirectory = $wd
           $p = [System.Diagnostics.Process]::Start($psi)
-          Write-Host "Patch.cmd 启动 (PID $($p.Id))"
+          Write-Host "Patch.cmd 启动 (PID $($p.Id), cwd=$($psi.WorkingDirectory))"
           while (-not $p.HasExited) {
             Start-Sleep -Seconds 5
             if (Test-Path $log) { Get-Content $log -Tail 8 -ErrorAction SilentlyContinue | ForEach-Object { "· $_" } }
             Write-Host "… Patch.cmd 仍在运行 ($([math]::Round((Get-Date).Subtract($p.StartTime).TotalMinutes,1)) min)"
           }
-          Write-Host "=== Patch.cmd 末 40 行 ==="
-          if (Test-Path $log) { Get-Content $log -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { "· $_" } }
+          $mins = [math]::Round((Get-Date).Subtract($p.StartTime).TotalMinutes, 1)
+          Write-Host "=== Patch.cmd 已退出（退出码 $($p.ExitCode)，耗时 $mins min），末 200 行 ==="
+          if (Test-Path $log) { Get-Content $log -Tail 200 -ErrorAction SilentlyContinue | ForEach-Object { "· $_" } }
+          else { Write-Host "！未生成 $log —— 子进程可能秒退，检查上面的 cwd / Patch.cmd 是否存在" }
           if ($p.ExitCode -ne 0) { throw "Patch.cmd 退出码 $($p.ExitCode)" }
           Write-Host "Patch.cmd 完成 (退出码 0)"
 
