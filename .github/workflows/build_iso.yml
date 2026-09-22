@@ -133,15 +133,20 @@ jobs:
           # 唯一上游依赖，不可替换：delta 全部挂在它产出的 install.wim 上。
           # 不钉 ref —— 持续吃上游最新；实际 commit 记进 Release notes。
           UPSTREAM_URL="https://github.com/adavak/Win_ISO_Patching_Scripts.git"
-          git clone --depth 1 "$UPSTREAM_URL" src
-          echo "UPSTREAM_COMMIT=$(cd src && git rev-parse HEAD)" >> "$GITHUB_ENV"
+          # --progress：git 默认只在终端里刷进度；CI 的 stdout 是管道，不加这个开关
+          #   就一个字节都不打（实测该步真实输出只有那行 `Cloning into 'src'...`）。
+          git clone --depth 1 --progress "$UPSTREAM_URL" src
+          UPSTREAM_COMMIT=$(cd src && git rev-parse HEAD)
+          echo "UPSTREAM_COMMIT=$UPSTREAM_COMMIT" >> "$GITHUB_ENV"
+          echo "上游 commit: $UPSTREAM_COMMIT"
 
       - name: 套 delta 到上游快照（删 update-meta4.yml）
         shell: bash
         run: |
-          cp -r self/delta/* src/
+          # -v：把每个被拷入/覆盖的文件名逐条打出来 —— 命令窗里能看清我们把上游哪些文件换掉了
+          cp -rv self/delta/* src/
           # 根级配置要进 src：delta/lib/*.ps1 都是按 -WorkDir(=%cd%=src) 读取的
-          cp -f self/config.json src/config.json
+          cp -fv self/config.json src/config.json
           rm -f src/.github/workflows/update-meta4.yml || true
           echo "--- src 顶层文件 ---"
           ls -1 src/
@@ -184,49 +189,85 @@ jobs:
         run: |
           $isoName = $env:SRC_ISO
           $expected = $env:SRC_SHA256
+          $repo = "${{ github.repository }}"
           Write-Host "源镜像: $isoName"
           if ([string]::IsNullOrWhiteSpace($isoName) -or [string]::IsNullOrWhiteSpace($expected)) {
             throw "矩阵缺少 iso / sha256（检查 config.yml 的 baseline.sources）"
           }
           New-Item -ItemType Directory -Force -Path chunks | Out-Null
-          gh release download baseline --repo "${{ github.repository }}" --dir chunks --pattern "*$isoName.part*"
-          # 按 .part 后的数字排序，顺序字节拼回（与切分严格互逆，等同 copy /b）
+
+          # ── ① 分块清单：先把「要下什么、多大」如实打出来
+          # gh 在非终端里一个字节都不打（进度条只在真终端渲染），所以由我们把清单打出来。
+          # 用 gh api 取 assets 而不是 ls 本地目录：这样"清单"来自 Release 的事实，不是猜的。
+          $release = gh api "repos/$repo/releases/tags/baseline" | ConvertFrom-Json
+          $assets  = @($release.assets | Where-Object { $_.name -like "$isoName.part*" } |
+                       Sort-Object { [int]($_.name -replace '.*\.part', '') })
+          if ($assets.Count -eq 0) { throw "未找到 baseline 分块（请先运行 Fetch Baseline ISO）" }
+          $sum = ($assets | Measure-Object -Property size -Sum).Sum
+          Write-Host ("baseline 分块清单（{0} 块，合计 {1:N2} GB）：" -f $assets.Count, ($sum / 1GB))
+          foreach ($a in $assets) { Write-Host ("  {0}  {1:N1} MB" -f $a.name, ($a.size / 1MB)) }
+
+          # ── ② 逐块下载：每块下完打「实测大小 + 真实耗时」——下载全程是看得见的
+          $i = 0
+          foreach ($a in $assets) {
+            $i++
+            $t0 = Get-Date
+            gh release download baseline --repo $repo --dir chunks --pattern $a.name
+            if ($LASTEXITCODE -ne 0) { throw "分块下载失败: $($a.name)" }
+            $got  = Get-Item (Join-Path chunks $a.name)
+            $secs = ((Get-Date) - $t0).TotalSeconds
+            Write-Host ("  [{0}/{1}] {2}  实测 {3:N1} MB  用时 {4:N1}s" -f $i, $assets.Count, $a.name, ($got.Length / 1MB), $secs)
+          }
+
+          # ── ③ 按 .part 后的数字排序，顺序字节拼回（与切分严格互逆，等同 copy /b）
           $parts = @(Get-ChildItem chunks -Filter "$isoName.part*" | Sort-Object { [int]($_.Name -replace '.*\.part', '') })
-          if ($parts.Count -eq 0) { throw "未找到 baseline 分块（请先运行 Fetch Baseline ISO）" }
+          $total = ($parts | Measure-Object -Property Length -Sum).Sum
+          Write-Host ("开始按序拼接 {0} 块 -> baseline_out.iso（合计 {1:N2} GB）" -f $parts.Count, ($total / 1GB))
           $fs = [System.IO.File]::Create("baseline_out.iso")
           try {
             foreach ($p in $parts) {
               $in = [System.IO.File]::OpenRead($p.FullName)
               try { $in.CopyTo($fs) } finally { $in.Close() }
+              Write-Host ("  + {0}  {1:N1} MB" -f $p.Name, ($p.Length / 1MB))
             }
           } finally { $fs.Close() }
           $iso = Get-Item "baseline_out.iso"
           if (-not $iso) { throw "RAW 重组未产出 ISO" }
+          Write-Host ("拼接完成: {0}  {1:N2} GB" -f $iso.Name, ($iso.Length / 1GB))
           Move-Item $iso.FullName "src\baseline-$($env:BRANCH).iso" -Force
-          $actual = (Get-FileHash "src\baseline-$($env:BRANCH).iso" -Algorithm SHA256).Hash
+
+          # ── ④ SHA256：5GB 要跑十几秒，进前先报一声，别让人以为卡住
+          $dst = "src\baseline-$($env:BRANCH).iso"
+          Write-Host ("SHA256 计算中：{0}（{1:N2} GB）…" -f (Split-Path $dst -Leaf), ((Get-Item $dst).Length / 1GB))
+          $t0 = Get-Date
+          $actual = (Get-FileHash $dst -Algorithm SHA256).Hash
+          $secs = ((Get-Date) - $t0).TotalSeconds
           if ($actual -ne $expected) { throw "baseline SHA256 不符! 期望 $expected 实际 $actual" }
-          Write-Host "baseline SHA256 OK: $actual"
-          # 释放磁盘：分块与重组目录已无用（runner D: 仅约 14GB）
+          Write-Host ("baseline SHA256 OK: {0}（用时 {1:N1}s）" -f $actual, $secs)
+
+          # 释放磁盘：分块与重组目录已无用
           Remove-Item chunks, baseline_out.iso -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host ("已清理分块与临时文件，释放 {0:N2} GB" -f ($total / 1GB))
 
       - name: 运行 Patch.cmd（A→B→W10UI→E→D）
-        # 此步最耗时（20~40min），必须让 Actions 日志全程有可见活动，否则像卡死。
-        # [机制] Patch.cmd 自身**不做任何重定向**（本地双击运行时命令窗里是什么就是什么），
-        #   由本步的父进程统一把它接管成 `cmd /c "Patch.cmd <branch> > logs\Patch.log 2>&1"`，
-        #   再用常开的 StreamReader 增量跟随该文件（只打新行、不重复刷屏），每 5s 一轮并打印
-        #   "仍在运行 + 累计行数" 的心跳。于是 命令窗内容 == Patch.log == web 上看到的内容。
-        #   ⚠ 因此**不要**改回 `Patch.cmd` 内部重定向 —— 那会让命令窗彻底空白（历史踩过）。
+        # 此步最耗时（20~40min）。目标：**web 日志 = 真机命令窗的内容，一行不多、一行不少**。
+        # [机制] Patch.cmd 自身不做任何重定向（本地双击运行时命令窗里是什么就是什么）；
+        #   由本步父进程接管 `cmd /c "chcp 65001 & Patch.cmd <branch> > logs\Patch.log 2>&1"`，
+        #   再用常开的 StreamReader 增量跟随该文件，把它**原样**写到 step 输出 ——
+        #   于是「本地命令窗 == src\logs\Patch.log == web 日志」三者同一份字节。
+        #   ⚠ 不要改回在 Patch.cmd 内部重定向（那会让命令窗彻底空白，历史踩过）。
+        #   ⚠ **不要在本步加入任何自己的输出**（心跳 / 计数 / 分隔线 / 启动提示）—— 那属于
+        #     "不属于命令窗的内容"，会被一眼看出是假进度。诊断信息一律走失败时的 annotation。
         # [坑①·实测复现] 重定向路径按「执行那一刻的当前目录」解析：写 `cd src && ... > src\x.log`
         #   会把 `src\` 再拼一层（= src\src\x.log，目录不存在）→ cmd 报
         #   "The system cannot find the path specified."、退出码 1，Patch.cmd 一个字符都不跑。
         #   故**不 cd**，用 `working-directory: src` + ProcessStartInfo.WorkingDirectory 指定工作目录，
         #   重定向写相对路径 `logs\Patch.log`（相对 src 解析，正好落在 src\logs\Patch.log）。
         # [坑②] 重定向目标所在目录必须**先存在**：cmd 在启动那一刻就会打开文件，目录不在即秒退。
-        #   故先 mkdir src\logs（Patch.cmd 自己也建，双保险）。
-        # [编码] 先 chcp 65001：Patch.cmd 是 UTF-8 文件、含中文 echo，控制台输出码页不设成
+        #   故先 mkdir logs（Patch.cmd 自己也建，双保险）。
+        # [编码] 父进程先 chcp 65001：Patch.cmd 是 UTF-8 文件、含中文 echo，输出码页不设成
         #   65001 会整片乱码。上游 W10UI.cmd 实测纯 ASCII，不受影响。
-        #   ⚠ 不要在 Patch.cmd 里 chcp（批处理中途改码页会让 cmd 行偏移错位，已知会跳行），
-        #     码页必须在父进程设好。
+        #   ⚠ 不要在 Patch.cmd 里 chcp（批处理中途改码页会让 cmd 行偏移错位，已知会跳行）。
         if: env.SKIP != '1'
         shell: pwsh
         working-directory: src
@@ -251,45 +292,44 @@ jobs:
           $psi.UseShellExecute = $false
           $psi.WorkingDirectory = $wd
           $p = [System.Diagnostics.Process]::Start($psi)
-          Write-Host "Patch.cmd 启动 (PID $($p.Id), cwd=$wd, 分支=$env:BRANCH)"
-          Write-Host "命令窗内容跟随: $patchlog（Patch.cmd 自身零重定向，全部原样落这里）"
 
-          $reader  = $null
-          $lines   = 0
-          $pending = ""                       # 尚未以 \n 结束的尾巴（原地刷新的进度条会落在这里）
+          $reader   = $null
+          $pending  = ""                      # 尚未以 \n 结束的尾巴（原地刷新的进度条会落在这里）
           $progLast = $null                   # 最近一条「进度条」，只保留最后一条
-          $chunk   = New-Object char[] 65536
-          $esc     = [string][char]27
-          # 进度条判定：`[==== 55.0% ====]` / `[=== 96.5%====]` 这类，不管等号在左还是在右。
+          $chunk    = New-Object char[] 65536
+          $ansi     = [string][char]27
+
+          # 进度条行判定：`[==== 55.0% ====]` / `[=== 96.5%====]` 这类（等号在左或在右都认）。
           function Test-ProgressLine([string]$s) {
             return ($s -match '^\s*\[[=*\s]*\d{1,3}(\.\d+)?%[=*\s]*\]\s*$')
           }
-          # 把 pending 里「已完整」的行打出去。三条规则：
-          #  1) 按 \n 切；行内残留的 \r 视为**终端行内覆盖**，只留最后一段（DISM 会用 CR 原地重写）。
-          #  2) 纯进度条行**不逐条刷屏**，只记住最后一条；等下一条真实输出到来时补打一次，
-          #     其余时间由心跳里的「当前: …」实时呈现 —— 这正是真机命令窗的语义（屏幕上永远只有一条进度）。
-          #  3) 顺带剥掉 ANSI 转义序列。
-          # 为什么必须这么干：CI #24 的「累计 6350 行」里 98% 是 DISM 每 1% 一行的进度条，
-          # 真正的输出（W10UI 阶段名、msu 清单、报错）被彻底淹没，看起来像"卡住不动"。
+
+          # 把命令窗的内容原样打出去。这里只做**终端语义还原**，不做内容加工：
+          #   · 行内残留的 \r = 终端「原地覆盖重写」，只留覆盖后的那一段（DISM/W10UI 进度条就这么刷）
+          #   · 纯进度条行只打最后一条 —— 真机命令窗从始至终也只显示那一行
+          #   · 剥掉 ANSI 转义序列
+          # 除此之外**一个字都不加**：没有心跳、没有计数、没有分隔线。
           function Flush-Lines {
             while (($i = $script:pending.IndexOf("`n")) -ge 0) {
               $line = $script:pending.Substring(0, $i)
               $script:pending = $script:pending.Substring($i + 1)
-              $line = ($line.TrimEnd("`r")) -replace ($esc + "\[[0-9;?]*[A-Za-z]"), ""
+              $line = ($line.TrimEnd("`r")) -replace ($ansi + "\[[0-9;?]*[A-Za-z]"), ""
               if ($line.IndexOf("`r") -ge 0) { $line = ($line -split "`r")[-1] }
               if ($line.Trim().Length -eq 0) { continue }
               if (Test-ProgressLine $line) { $script:progLast = $line.Trim(); continue }
-              if ($script:progLast) { Write-Host ("  " + $script:progLast); $script:lines++; $script:progLast = $null }
+              if ($script:progLast) { Write-Host $script:progLast; $script:progLast = $null }
               Write-Host $line
-              $script:lines++
             }
-            if ($script:pending.Length -gt 4000) {   # 只刷进度条、长时间不换行时别让它无限膨胀
+            # 极端情况兜底：只有进度条、长时间不换行时别让 pending 无限膨胀
+            if ($script:pending.Length -gt 4000) {
               $script:pending = $script:pending.Substring($script:pending.Length - 4000)
             }
           }
+
+          # 1s 一轮：越短越"同步"；开销可忽略（只读文件尾的新增字节）
           try {
             while (-not $p.HasExited) {
-              Start-Sleep -Seconds 5
+              Start-Sleep -Seconds 1
               # 日志文件由 cmd 在启动时创建，出现后再打开并保持（FileShare.ReadWrite 允许边写边读）
               if ($null -eq $reader -and (Test-Path $patchlog)) {
                 try {
@@ -304,60 +344,30 @@ jobs:
                 }
                 Flush-Lines
               }
-              # 心跳：即使上游只在原地刷进度条（长时间没有换行），也把「当前那一行」打出来 ——
-              # 那正是真机命令窗此刻显示的内容。
-              $hb = "… Patch.cmd 仍在运行 ($([math]::Round((Get-Date).Subtract($p.StartTime).TotalMinutes,1)) min, 累计输出 $lines 行)"
-              $cur = ""
-              if ($progLast) { $cur = $progLast }
-              else {
-                # 必须先 TrimEnd 掉结尾的 CR/LF：进度条是 `[=== 55%]` + CR，
-                # 直接取 `-split "\r"` 的最后一段会拿到空串（本地实测踩到）。
-                $tail = $pending.TrimEnd("`r", "`n").Trim()
-                if ($tail) { $cur = (($tail -split "`r")[-1]).Trim() }
-              }
-              if ($cur.Length -gt 180) { $cur = "…" + $cur.Substring($cur.Length - 180) }
-              if ($cur) { $hb += " | 当前: $cur" }
-              Write-Host $hb
             }
           } finally { if ($reader) { $reader.Dispose() } }
 
-          # 进程可能在上一次 5s 轮询之内就结束了：退出后把剩余缓冲收尾读完
-          if ($reader) {
-            try {
-              while (($n = $reader.Read($chunk, 0, $chunk.Length)) -gt 0) { $pending += (-join $chunk[0..($n - 1)]) }
-            } catch {}
+          if ($null -eq $reader) {
+            throw "无法打开 $patchlog（cmd 秒退 / 重定向目录不存在？）—— 检查 Patch.cmd 与 logs 目录"
           }
+          # 进程可能在上一次轮询之内就结束了：退出后把剩余缓冲收尾读完
+          try {
+            while (($n = $reader.Read($chunk, 0, $chunk.Length)) -gt 0) { $pending += (-join $chunk[0..($n - 1)]) }
+          } catch {}
           Flush-Lines
-          if ($progLast) { Write-Host ("  " + $progLast); $lines++; $progLast = $null }
-          if ($pending.Trim().Length -gt 0) {
-            $cur = (($pending.TrimEnd("`r", "`n") -split "`r")[-1]).Trim()
-            if ($cur) { Write-Host $cur; $lines++ }
-          }
+          if ($progLast) { Write-Host $progLast; $progLast = $null }
 
-          $mins = [math]::Round((Get-Date).Subtract($p.StartTime).TotalMinutes, 1)
-          Write-Host "=== Patch.cmd 已退出（退出码 $($p.ExitCode)，耗时 $mins min，累计输出 $lines 行）==="
-          if ($lines -eq 0) {
-            if (Test-Path $patchlog) {
-              Write-Host "=== 流式跟随未取到内容，兜底打印 $patchlog 末 200 行 ==="
-              Get-Content $patchlog -Tail 200 | ForEach-Object { Write-Host $_ }
-            } else {
-              Write-Host "！未生成 $patchlog —— 子进程可能在启动那一刻就失败了，检查上面的 cwd / 重定向目录"
-            }
-          }
           if ($p.ExitCode -ne 0) {
-            # [关键] 把失败现场写进 GitHub annotation。annotation 走 check-runs API：
-            #     GET /repos/{owner}/{repo}/check-runs/{job_id}/annotations
-            #   **无需登录/无需令牌即可读取**；而原始 job 日志（.../jobs/{id}/logs）必须认证，
-            #   匿名访问只会 403。故 annotation 是本项目在无凭据环境下定位 CI 失败的唯一通道。
-            #   转义规则（GitHub workflow command 约定）：行内 % -> %25，行间换行 -> %0A。
+            # 全步唯一一处「非命令窗内容」，且只在**失败时**出现：把失败现场写进 annotation。
+            # annotation 走 check-runs API，**无需登录/令牌即可读**（原始 job 日志必须认证，匿名 403）。
+            # 转义规则（GitHub workflow command 约定）：行内 % -> %25，行间换行 -> %0A。
             $tail = @()
             if (Test-Path $patchlog) { $tail = @(Get-Content $patchlog -Tail 25 -ErrorAction SilentlyContinue) }
-            $esc  = ($tail | ForEach-Object { ($_ -replace '%','%25').TrimEnd() }) -join '%0A'
-            if ($esc.Length -gt 3800) { $esc = $esc.Substring($esc.Length - 3800) }
-            Write-Host ("::error title=Patch.cmd failed exit=" + $p.ExitCode + " elapsedMin=" + $mins + " (logs last 25 lines)::" + $esc)
+            $msg  = ($tail | ForEach-Object { ($_ -replace '%','%25').TrimEnd() }) -join '%0A'
+            if ($msg.Length -gt 3800) { $msg = $msg.Substring($msg.Length - 3800) }
+            Write-Host ("::error title=Patch.cmd failed exit=" + $p.ExitCode + "::" + $msg)
             throw "Patch.cmd 退出码 $($p.ExitCode)"
           }
-          Write-Host "Patch.cmd 完成（退出码 0）"
 
       - name: 保留 Patch 日志（失败/取消时上传，便于离线排查）
         # 该步与本 job 其它步骤相互独立：只在前面失败/取消时执行。
@@ -376,6 +386,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          $repo = "${{ github.repository }}"
           $m = Get-Content src/manifest.json | ConvertFrom-Json
           $ubr = $m.targetUBR
           $date = Get-Date -Format yyMMdd
@@ -389,19 +400,32 @@ jobs:
           echo "ISO_BASE=$isoBase" >> $env:GITHUB_ENV
           echo "DATE=$date" >> $env:GITHUB_ENV
           echo "UBR=$ubr" >> $env:GITHUB_ENV
+          Write-Host "manifest 目标 UBR: $ubr"
           Write-Host "TAG=$tag  ISO_BASE=$isoBase"
-          # 释放磁盘：最终 ISO 已封装完，中间 DVD 目录(~5.3GB)不再需要。runner D: 仅约 14GB。
-          Remove-Item src/ISO -Recurse -Force -ErrorAction SilentlyContinue
+          # 释放磁盘：最终 ISO 已封装完，中间 DVD 目录不再需要（W10UI 产出的封装 ISO + 解开的分布文件夹）
+          if (Test-Path src/ISO) {
+            $gb = [math]::Round((Get-ChildItem src/ISO -Recurse -File -ErrorAction SilentlyContinue |
+                                 Measure-Object -Property Length -Sum).Sum / 1GB, 2)
+            Remove-Item src/ISO -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "已删除中间目录 src/ISO，释放 $gb GB"
+          }
           if ($env:DO_RELEASE -eq 'true') {
             $logs = @(Get-ChildItem src/logs -Filter *.log -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+            Write-Host "Release 附件清单（$($logs.Count) 个日志 + manifest.json）："
+            foreach ($l in $logs) { Write-Host ("  {0}  {1:N0} B" -f (Split-Path $l -Leaf), (Get-Item $l).Length) }
+            Write-Host ("  manifest.json  {0:N0} B" -f (Get-Item src/manifest.json).Length)
             # 幂等：同月同 UBR 重跑会撞同名 tag（上次的失败运行也留下过空壳 Release），先删再建
-            gh release view "$tag" --repo "${{ github.repository }}" 2>$null
+            gh release view "$tag" --repo $repo 2>$null
             if ($LASTEXITCODE -eq 0) {
               Write-Host "已存在同名 Release $tag -> 删除后重建（幂等重跑）"
-              gh release delete "$tag" --repo "${{ github.repository }}" --yes
-              gh api --method DELETE "/repos/${{ github.repository }}/git/refs/tags/$tag" 2>$null
+              gh release delete "$tag" --repo $repo --yes
+              gh api --method DELETE "/repos/$repo/git/refs/tags/$tag" 2>$null
+            } else {
+              Write-Host "无同名 Release，直接创建 $tag"
             }
-            gh release create "$tag" --repo "${{ github.repository }}" --title "$tag" --notes "branch=${{ matrix.branch }} | upstream_commit=$env:UPSTREAM_COMMIT | UBR=$ubr | 源镜像=$env:SRC_ISO" @logs src/manifest.json
+            gh release create "$tag" --repo $repo --title "$tag" --notes "branch=${{ matrix.branch }} | upstream_commit=$env:UPSTREAM_COMMIT | UBR=$ubr | 源镜像=$env:SRC_ISO" @logs src/manifest.json
+            if ($LASTEXITCODE -ne 0) { throw "Release 创建失败: $tag" }
+            Write-Host "Release $tag 已创建: $(gh release view "$tag" --repo $repo --json url --jq .url)"
           }
 
       - name: 重命名 + RAW 切分上传 ISO（≤1.9GiB/片，上岸即删）+ 生成 merge.cmd
@@ -410,6 +434,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          $repo = "${{ github.repository }}"
           # [关键] Patch.cmd 在 src/ 下执行，产物落在 src/out/WinLTSC-<branch>.iso；本步工作目录是仓库根，必须带 src/ 前缀
           $isoPath = "src/out/WinLTSC-${{ matrix.branch }}.iso"
           if (-not (Test-Path $isoPath)) {
@@ -422,10 +447,14 @@ jobs:
           Move-Item $isoPath $finalIso -Force
           $iso = Get-Item $finalIso
           $size = $iso.Length
+          Write-Host ("最终 ISO: {0}  {1:N2} GB（{2:N0} 字节）" -f $iso.Name, ($size / 1GB), $size)
+          Write-Host ("SHA256 计算中（{0:N2} GB）…" -f ($size / 1GB))
+          $t0 = Get-Date
           $hash = (Get-FileHash $finalIso -Algorithm SHA256).Hash
-          Write-Host "ISO size = $([math]::Round($size/1GB,2)) GB  SHA256=$hash"
+          Write-Host ("ISO SHA256 = {0}（用时 {1:N1}s）" -f $hash, ((Get-Date) - $t0).TotalSeconds)
           # 逐片生成 -> 上传 -> 立即删除，避免 ISO(7.9GB)+全部分片(~7.9GB) 同时占盘撑爆 runner
           $chunk = 1900L * 1024L * 1024L
+          Write-Host ("按 {0:N0} MB/片切分，预计 {1} 片" -f ($chunk / 1MB), [math]::Ceiling($size / $chunk))
           $buf = New-Object byte[] (16777216)
           New-Item -ItemType Directory -Force -Path out | Out-Null
           $idx = 1
@@ -433,6 +462,7 @@ jobs:
           try {
             while ($fs.Position -lt $size) {
               $name = "out/$isoBase.iso.part$idx"
+              $t0 = Get-Date
               $out = [System.IO.File]::Create($name)
               try {
                 $written = 0L
@@ -444,13 +474,15 @@ jobs:
                   $written += $n
                 }
               } finally { $out.Close() }
-              Write-Host "upload $name ($([math]::Round($written/1MB,1)) MB)"
+              Write-Host ("upload {0}（{1:N1} MB，切片用时 {2:N1}s）" -f $name, ($written / 1MB), ((Get-Date) - $t0).TotalSeconds)
+              $t0 = Get-Date
               $ok = $false
               for ($i = 1; $i -le 3 -and -not $ok; $i++) {
-                gh release upload "$env:TAG" $name --repo "${{ github.repository }}" --clobber
+                gh release upload "$env:TAG" $name --repo $repo --clobber
                 if ($LASTEXITCODE -eq 0) { $ok = $true } else { Write-Host "第 $i 次上传失败，重试…"; Start-Sleep -Seconds 10 }
               }
               if (-not $ok) { throw "分片 $name 上传失败（已重试 3 次）" }
+              Write-Host ("  -> {0} 上传完成，用时 {1:N1}s" -f (Split-Path $name -Leaf), ((Get-Date) - $t0).TotalSeconds)
               Remove-Item $name -Force
               $idx++
             }
@@ -462,14 +494,18 @@ jobs:
           # 生成 merge.cmd（内嵌本 ISO 期望哈希）并上传
           $tpl = Get-Content self/assets/release/merge.cmd -Raw
           $expLine = 'set "EXP_' + $isoBase + '.iso=' + $hash.ToUpper() + '"'
+          Write-Host "merge.cmd 内嵌期望哈希行：$expLine"
           $tpl = $tpl -replace '(?s)(REM ===EXPECTED_HASHES_START===).*?(REM ===EXPECTED_HASHES_END===)', ('$1' + [Environment]::NewLine + $expLine + [Environment]::NewLine + '$2')
           Set-Content -Path "out/merge.cmd" -Value $tpl -NoNewline
-          gh release upload "$env:TAG" "out/merge.cmd" --repo "${{ github.repository }}" --clobber
+          gh release upload "$env:TAG" "out/merge.cmd" --repo $repo --clobber
+          if ($LASTEXITCODE -ne 0) { throw "merge.cmd 上传失败" }
+          Write-Host ("  -> merge.cmd 上传完成（{0:N0} 字节）" -f (Get-Item "out/merge.cmd").Length)
           Remove-Item "out/merge.cmd" -Force
           # 校验 Release 资产数与 part 数一致
-          $assets = (gh api "repos/${{ github.repository }}/releases/tags/$env:TAG" | ConvertFrom-Json).assets | Where-Object { $_.name -like "*.part*" }
-          Write-Host "Release 上的 part 资产数：$($assets.Count)"
+          $assets = (gh api "repos/$repo/releases/tags/$env:TAG" | ConvertFrom-Json).assets | Where-Object { $_.name -like "*.part*" }
+          Write-Host "Release 上的 part 资产数：$($assets.Count)（期望 $expected）"
           if ($assets.Count -lt $expected) { throw "Release 资产缺失：期望 $expected 个 part，实际 $($assets.Count) 个" }
+          Write-Host "Release URL: $(gh release view "$env:TAG" --repo $repo --json url --jq .url)"
           # R2 / SharePoint 通道若开启则需保留 ISO；否则删掉释放磁盘
           if ($env:DO_R2 -ne 'true' -and $env:DO_ONEDRIVE -ne 'true') {
             Remove-Item $finalIso -Force
