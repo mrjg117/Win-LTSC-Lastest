@@ -147,10 +147,14 @@ jobs:
           ls -1 src/
 
       - name: 抓取载荷（按 config 声明的 components + apps）
-        shell: bash
+        # [必须 pwsh，不能用 bash] windows runner 的 Git Bash 里**没有** `python` 命令
+        #   （只有 MSYS 自带的 `python3`，那是另一个解释器，不带 pip 装好的包）。
+        #   实测报错：/bin/bash: line 1: python: command not found → 整个 step 挂。
+        #   setup-python 装的是 Windows 版 python.exe，只在 PowerShell 的 PATH 里可靠可见。
+        shell: pwsh
         run: |
           # 载荷落进 src/assets/{redist,apps}，正是 delta 脚本读取的位置
-          python self/tools/fetch-payloads.py --config self/config.json --dest src --branch "${{ matrix.branch }}"
+          python self/tools/fetch-payloads.py --config self/config.json --dest src --branch $env:BRANCH
 
       - name: cron 去重（仅每月兜底，本月已构建则跳过）
         if: github.event_name == 'schedule'

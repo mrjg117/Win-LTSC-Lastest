@@ -455,6 +455,7 @@ Server 是 `26100.33451`，客户端真值却是 `26100.9457`），取最大值�
 | `manifest.json`、生成的 `.cmd` | **UTF-8 无 BOM**（用 .NET `UTF8Encoding($false)` 写） | 同一句 `Set-Content -Encoding UTF8` 在 5.1 写 BOM、在 7 不写，行为会随宿主漂移；显式 .NET 编码才两端一致 |
 | 上游 `W10UI.ini` | **字节保真**（ISO-8859-1 做 1:1 字节映射读写） | 它的编码不由我们控制；只改命中的 ASCII 键，未命中行逐字节不动，绝不写 BOM、不换换行符 |
 | Python 脚本的 `print` | 开头 `sys.stdout.reconfigure(encoding="utf-8", errors="replace")` | CI 的 Windows runner 是 en-US，stdout 回退 cp1252，一打印中文就 `UnicodeEncodeError` 整步挂掉（本机 cp936 永远测不出来） |
+| `shell: bash` 里**别调 `python`** | Windows 上要调 python 的 step 一律用 `shell: pwsh` | windows runner 的 Git Bash 里**没有 `python` 命令**（实测 `/bin/bash: line 1: python: command not found`）→ 整个 step 挂；`actions/setup-python` 装的是 Windows 版 `python.exe`，只在 PowerShell 的 PATH 里可靠可见 |
 
 > **改脚本/表之后务必复查 BOM**：`Edit`/`Write` 工具可能把 BOM 抹掉，而 `.ps1` 少了 BOM
 > 在 5.1 上会静默变成 ANSI 解码 —— 中文先烂，报的却是「意外的标记」这类看不出根因的语法错。
