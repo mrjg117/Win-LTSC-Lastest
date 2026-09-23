@@ -72,7 +72,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\99.Force-W10UI
 if errorlevel 1 goto :fail
 
 REM ---- 解压 baseline ISO 到分布文件夹（供 W10UI 集成补丁） ----
-echo [%date% %time%] 解压 baseline ISO -> ISO\
+echo [%date% %time%] 解压 baseline ISO ^> ISO\
 bin\7z.exe x "baseline-%BRANCH%.iso" -o"ISO" -y
 if errorlevel 1 goto :fail
 REM 注意：baseline-<分支>.iso 此刻**不能删**——01.Build-Manifest 还要从它里提取
@@ -130,7 +130,7 @@ bin\oscdimg.exe -m -o -u2 -udfver102 ^
   "ISO" "out\WinLTSC-%BRANCH%.iso"
 if errorlevel 1 goto :fail
 
-echo [%date% %time%] 完成 -> out\WinLTSC-%BRANCH%.iso
+echo [%date% %time%] 完成 ^> out\WinLTSC-%BRANCH%.iso
 exit /b 0
 
 :fail

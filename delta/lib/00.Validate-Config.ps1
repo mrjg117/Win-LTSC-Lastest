@@ -3,6 +3,7 @@
 .DESCRIPTION 昂贵的 W10UI 集成补丁（~39 分钟）跑在最前，而大部分 bug 藏在它之后的
              自定义步骤里。本步在 W10UI 之前、零镜像挂载地做：
                1) lib\*.ps1 全部 AST 语法解析 + UTF-8 BOM + CRLF 检查
+               1b) 任意 *.cmd/*.bat 里 echo 行含未转义 >（cmd 把 "->" 当重定向，会截断成品 ISO）
                2) 危险写法扫描：reg.exe add（引号不转义会炸）、PS provider 读离线 hive
                   （句柄泄漏致 unload 失败）、HKLM:\HKLM 重复前缀
                3) config.json 的 optimize.registry 每条：hive 已知 / type 已知 /
@@ -49,6 +50,27 @@ foreach ($f in (Get-ChildItem $lib -Filter *.ps1 | Sort-Object Name)) {
             $issues += "禁止 PS registry provider 读离线 hive（句柄泄漏致 unload Access denied）: $($f.Name)"
         }
         if ($code -match 'HKLM:\\HKLM') { $issues += "HKLM 路径重复前缀 HKLM:\HKLM: $($f.Name)" }
+    }
+}
+
+# ---- 1b) cmd/bat 里的未转义 > 重定向陷阱 ----
+# [为什么] Windows cmd 把 echo 文本中的 "->" 当成文件重定向：Patch.cmd 第 133 行
+#   `echo ... 完成 -> out\WinLTSC.iso` 会把刚 oscdimg 生成的 6.48GB ISO 截断成 39 字节
+#   的 echo 文本 —— 这正是 run #29「假绿、产物坏」的真正根因。必须在 W10UI 之前秒级拦下。
+# [规则] 本仓 echo 一律不重定向（见 Patch.cmd 头部约定），故 echo 行里出现「未转义的 >」
+#   （前面不是 ^）即阻断。先剥掉 "..." 引号段，避免引号内文本误报。
+$bats = @(Get-ChildItem $WorkDir -Filter *.cmd -ErrorAction SilentlyContinue) +
+        @(Get-ChildItem $WorkDir -Filter *.bat -ErrorAction SilentlyContinue) +
+        @(Get-ChildItem (Join-Path $WorkDir 'lib') -Filter *.cmd -ErrorAction SilentlyContinue) +
+        @(Get-ChildItem (Join-Path $WorkDir 'lib') -Filter *.bat -ErrorAction SilentlyContinue)
+foreach ($bat in ($bats | Sort-Object Name)) {
+    $lines = [IO.File]::ReadAllLines($bat.FullName)
+    for ($ln = 0; $ln -lt $lines.Count; $ln++) {
+        $line = $lines[$ln]
+        $stripped = $line -replace '"[^"]*"', '""'   # 剥引号段，引号内 > 不算重定向
+        if ($stripped -match '(?i)^\s*echo\b' -and $stripped -match '(?<!\^)>') {
+            $issues += "cmd 重定向陷阱（未转义 > 会截断产物，应写 ^>）: $($bat.Name) 第 $($ln+1) 行: $($line.Trim())"
+        }
     }
 }
 
