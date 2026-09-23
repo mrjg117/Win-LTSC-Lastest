@@ -36,6 +36,7 @@
 │   │
 │   ├── lib/                           构建期各阶段脚本，编号即执行顺序
 │   │   ├── 00.Precheck.ps1                预检 fail-fast：上游文件 / delta 脚本 / config.json / 磁盘
+│   │   ├── 00.Validate-Config.ps1          预检·脚本与配置：W10UI 前秒级校验全部 lib 语法/BOM/危险写法 + registry 项
 │   │   ├── 01.Build-Manifest.ps1          读 WIM 的 build·arch + 分支定义 → manifest.json
 │   │   ├── 02.Fetch-Updates.ps1           按上游 meta4 下载当月 LCU / SSU 到 patch\
 │   │   ├── 03.Integrate-Drivers.ps1       注入 assets/drivers（放文件就注入；被 08 调用）
@@ -280,7 +281,7 @@ UBR 用 06 实测值，不猜。
 
 ```
 config.yml ── optimize ──┬── ini        ──▶  99.Force-W10UI-Ini.ps1   （键置 1 写回上游 W10UI.ini）
-                         ├── registry   ──▶  07.Bake-Image.ps1        （08 挂载镜像后 reg load → 写 → unload）
+                         ├── registry   ──▶  07.Bake-Image.ps1        （08 挂载镜像后 reg load → .NET RegistryKey 写 → unload；不用 reg.exe add / PS provider，避免引号炸与句柄泄漏）
                          ├── components ──▶  07.Bake-Image.ps1        （抓载荷 → 写进应答 → 首启静默装）
                          └── _extensions                     （{ext} 占位符的取值清单，供 registry 展开）
 ```

@@ -43,9 +43,13 @@ if ($ownsMount) {
 try {
     $hive = Join-Path $mount 'Windows\System32\config\SOFTWARE'
     & reg.exe load 'HKLM\OFFLINE' $hive | Out-Null
-    $cv = Get-ItemProperty 'HKLM:\OFFLINE\Microsoft\Windows NT\CurrentVersion'
-    $curBuild = [int]($cv.CurrentBuildNumber)
-    $curUBR   = [int]($cv.UBR)
+    if ($LASTEXITCODE -ne 0) { throw "reg load OFFLINE 失败" }
+    # [关键] 读离线 hive 走 .NET，不用 PS provider（Get-ItemProperty 会留句柄、阻止下方 unload）
+    $off = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('OFFLINE', $false)
+    $cv  = $off.OpenSubKey('Microsoft\Windows NT\CurrentVersion')
+    $curBuild = [int]($cv.GetValue('CurrentBuildNumber'))
+    $curUBR   = [int]($cv.GetValue('UBR'))
+    $cv.Close(); $off.Close()
     Log "实测 build=$curBuild UBR=$curUBR（基线 build=$targetBuild，家族 [$($family -join ',')]）"
 
     if ($family -notcontains $curBuild) {
@@ -67,6 +71,8 @@ try {
 
     Log "== 断言通过: build=$curBuild UBR=$curUBR =="
 } finally {
+    # 先 GC 兜底释放 .NET 句柄，再 unload，避免 Access denied（与 07 同源）
+    [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
     & reg.exe unload 'HKLM\OFFLINE' 2>$null | Out-Null
     # 只卸自己挂的那次；08 会话里这步是只读断言，绝不能 Discard 掉前面 04/05 的改动
     if ($ownsMount) { Dismount-WindowsImage -Path $mount -Discard | Out-Null }

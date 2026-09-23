@@ -58,6 +58,14 @@ echo [%date% %time%] [00] 预检
 powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\00.Precheck.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%"
 if errorlevel 1 goto :fail
 
+REM ---- 00b 预检：脚本与配置（在 W10UI 之前秒级暴露所有潜在 bug） ----
+REM [为什么在这] 昂贵的 W10UI 集成（~39 分钟）跑在最前，而多数 bug 藏在它之后的
+REM   自定义步骤里。本步零镜像挂载地校验全部 lib 脚本语法/BOM/危险写法 + config.json
+REM   注册表项，有阻断项立刻列出全部、中止，不让 39 分钟白跑才发现第一个错。
+echo [%date% %time%] [00b] 校验脚本与配置
+powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\00.Validate-Config.ps1" -WorkDir "%PSWORKDIR%" -BranchId "%BRANCH%"
+if errorlevel 1 goto :fail
+
 REM ---- 99 强制 W10UI.ini 两行（在 W10UI 前） ----
 echo [%date% %time%] [99] 强制 ini
 powershell -NoProfile -ExecutionPolicy Bypass -File "%WORKDIR%lib\99.Force-W10UI-Ini.ps1" -WorkDir "%PSWORKDIR%"

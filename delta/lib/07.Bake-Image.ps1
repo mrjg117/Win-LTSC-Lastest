@@ -204,16 +204,16 @@ $ownsMount = -not $MountDir
 $mount = if ($MountDir) { $MountDir } else { Join-Path $WorkDir 'mount' }
 $installWim = Join-Path $WorkDir 'ISO\sources\install.wim'
 
-# hive 表同时记两种写法，绝不在用到时现场拼：
-#   key = reg.exe 形式（reg load / reg add 用）
-#   ps  = PowerShell provider 形式（Get-ChildItem 等用）
-# [坑·致命·#26 实测] 曾写成 Get-ChildItem "HKLM:\$($e.key)" —— 展开是
-#   HKLM:\HKLM\LTSC_SYS（多一层 HKLM），枚举不到任何 ControlSetNNN，
-#   于是 {CS} 类写入（电源/快速启动/BitLocker）全部 throw，两条分支都死在这里。
+# hive 表：key = 给 reg.exe load/unload 用的形式（HKLM\LTSC_XXX）
+# [关键·#26/#27 实测] 离线 hive 一律走 .NET [Microsoft.Win32.Registry]，绝不用
+#   PowerShell registry provider（Get-ChildItem/Get-ItemProperty 会在返回的键对象上
+#   留一个打开的句柄，不显式 Close 就阻止 reg unload，报 Access denied，且会掩盖
+#   真正的写入错误）。写值也用 .NET SetValue（引号/空格/% 全无问题，不像 reg.exe add
+#   在 PS 5.1 下不转义内嵌双引号导致整条命令语法错）。
 $HIVES = @{
-    SYSTEM   = @{ file = Join-Path $mount 'Windows\System32\config\SYSTEM';   key = 'HKLM\LTSC_SYS'; ps = 'HKLM:\LTSC_SYS' }
-    SOFTWARE = @{ file = Join-Path $mount 'Windows\System32\config\SOFTWARE'; key = 'HKLM\LTSC_SW';  ps = 'HKLM:\LTSC_SW'  }
-    DEFAULT  = @{ file = Join-Path $mount 'Users\Default\NTUSER.DAT';          key = 'HKLM\LTSC_DEF'; ps = 'HKLM:\LTSC_DEF' }
+    SYSTEM   = @{ file = Join-Path $mount 'Windows\System32\config\SYSTEM';   key = 'HKLM\LTSC_SYS' }
+    SOFTWARE = @{ file = Join-Path $mount 'Windows\System32\config\SOFTWARE'; key = 'HKLM\LTSC_SW'  }
+    DEFAULT  = @{ file = Join-Path $mount 'Users\Default\NTUSER.DAT';          key = 'HKLM\LTSC_DEF' }
 }
 
 if ($ownsMount) {
@@ -275,37 +275,67 @@ try {
         Log "展开后共 $($allPuts.Count) 条注册表写入"
 
         $needHives = @($allPuts | ForEach-Object { $_.hive } | Select-Object -Unique)
+        $hiveRoots = @{}      # hive -> 已打开的 [Microsoft.Win32.RegistryKey]（写完统一 Close）
+        $loadedKeys = @()     # 给 reg.exe unload 用的 key 列表
         foreach ($h in $needHives) {
             $e = $HIVES[$h]
             if (-not (Test-Path $e.file)) { throw "缺少 hive 文件: $($e.file)" }
             & reg.exe load $e.key $e.file | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "reg load 失败: $($e.key) <- $($e.file)" }
+            $loadedKeys += $e.key
             Log "已加载 hive $h -> $($e.key)"
         }
+        $writeErrors = @()
         try {
             foreach ($m in $allPuts) {
                 $e = $HIVES[$m.hive]
+                $hiveName = $e.key -replace '^HKLM\\', ''
+                $root = $hiveRoots[$m.hive]
+                if (-not $root) { $root = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($hiveName, $true); $hiveRoots[$m.hive] = $root }
                 $paths = @()
                 if ($m.path -like '*{CS}*') {
-                    $cs = @(Get-ChildItem $e.ps -ErrorAction SilentlyContinue |
-                            ForEach-Object { $_.PSChildName } | Where-Object { $_ -match '^ControlSet\d+$' })
-                    if ($cs.Count -eq 0) { throw "hive $($m.hive) 里找不到 ControlSetNNN，无法写入 $($m.path)" }
+                    $cs = @($root.GetSubKeyNames() | Where-Object { $_ -match '^ControlSet\d+$' })
+                    if ($cs.Count -eq 0) { $writeErrors += "hive $($m.hive) 里找不到 ControlSetNNN，无法写入 $($m.path)"; continue }
                     foreach ($c in $cs) { $paths += ($m.path -replace '\{CS\}', $c) }
                 } else {
                     $paths += $m.path
                 }
+                # 类型映射（config-to-json 已校验 type 合法，这里再兜一层）
+                $kind = switch ($m.type) {
+                    'REG_SZ'        { [Microsoft.Win32.RegistryValueKind]::String }
+                    'REG_EXPAND_SZ' { [Microsoft.Win32.RegistryValueKind]::ExpandString }
+                    'REG_DWORD'     { [Microsoft.Win32.RegistryValueKind]::DWord }
+                    'REG_QWORD'     { [Microsoft.Win32.RegistryValueKind]::QWord }
+                    'REG_BINARY'    { [Microsoft.Win32.RegistryValueKind]::Binary }
+                    'REG_MULTI_SZ'  { [Microsoft.Win32.RegistryValueKind]::MultiString }
+                    default         { $writeErrors += "未知注册表类型 $($m.type)（写入 $($m.path)）"; continue }
+                }
+                $data = if ($kind -eq [Microsoft.Win32.RegistryValueKind]::DWord -or $kind -eq [Microsoft.Win32.RegistryValueKind]::QWord) {
+                            try { [long]::Parse([string]$m.value) } catch { $writeErrors += "DWORD/QWORD 值不是数字: $($m.value)"; continue }
+                        } else { [string]$m.value }
                 foreach ($p in $paths) {
-                    $rk = "$($e.key)\$p"
-                    if ($m.name -eq '') { & reg.exe add $rk /ve /t $m.type /d "$($m.value)" /f | Out-Null }
-                    else                { & reg.exe add $rk /v $m.name /t $m.type /d "$($m.value)" /f | Out-Null }
-                    if ($LASTEXITCODE -ne 0) { throw "reg add 失败: $rk\$($m.name)=$($m.value)" }
-                    $leaf = if ($m.name -eq '') { '(默认)' } else { $m.name }
-                    Log "  [opt] $rk  $leaf = $($m.value)"
+                    try {
+                        $sub = $root.CreateSubKey($p)
+                        $sub.SetValue($m.name, $data, $kind)
+                        $sub.Close()
+                        $leaf = if ($m.name -eq '') { '(默认)' } else { $m.name }
+                        Log "  [opt] $($e.key)\$p  $leaf = $($m.value)"
+                    } catch {
+                        $writeErrors += "reg 写入失败 $($e.key)\$p\$($m.name): $($_.Exception.Message)"
+                    }
                 }
             }
+            if ($writeErrors.Count -gt 0) {
+                throw "离线注册表注入有 $($writeErrors.Count) 处失败：`n" + ($writeErrors -join "`n")
+            }
         } finally {
-            foreach ($h in $needHives) { & reg.exe unload $HIVES[$h].key 2>$null | Out-Null }
-            Log "hive 已卸载"
+            # 先关 .NET 句柄，再 GC 兜底，最后 reg unload —— 顺序错会导致 Access denied（#27 实测）
+            foreach ($k in $hiveRoots.Values) { try { $k.Close() } catch {} }
+            [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
+            foreach ($key in $loadedKeys) {
+                try { & reg.exe unload $key 2>$null | Out-Null; Log "hive 已卸载 $key" }
+                catch { Log "WARN hive 卸载失败（残留，不影响镜像内容）: $key" }
+            }
         }
     }
 
