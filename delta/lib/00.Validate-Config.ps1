@@ -59,11 +59,10 @@ foreach ($f in (Get-ChildItem $lib -Filter *.ps1 | Sort-Object Name)) {
 #   的 echo 文本 —— 这正是 run #29「假绿、产物坏」的真正根因。必须在 W10UI 之前秒级拦下。
 # [规则] 本仓 echo 一律不重定向（见 Patch.cmd 头部约定），故 echo 行里出现「未转义的 >」
 #   （前面不是 ^）即阻断。先剥掉 "..." 引号段，避免引号内文本误报。
-$bats = @(Get-ChildItem $WorkDir -Filter *.cmd -ErrorAction SilentlyContinue) +
-        @(Get-ChildItem $WorkDir -Filter *.bat -ErrorAction SilentlyContinue) +
-        @(Get-ChildItem (Join-Path $WorkDir 'lib') -Filter *.cmd -ErrorAction SilentlyContinue) +
-        @(Get-ChildItem (Join-Path $WorkDir 'lib') -Filter *.bat -ErrorAction SilentlyContinue)
-foreach ($bat in ($bats | Sort-Object Name)) {
+# [关键] 只校验本仓自有的 Patch.cmd —— 上游 W10UI.cmd 含 `echo.)>file` /
+#   `echo ^<...^>)>file` 这类「故意文件重定向」，若一并扫描会误报阻断正常构建。
+$bat = Get-Item (Join-Path $WorkDir 'Patch.cmd') -ErrorAction SilentlyContinue
+if ($bat) {
     $lines = [IO.File]::ReadAllLines($bat.FullName)
     for ($ln = 0; $ln -lt $lines.Count; $ln++) {
         $line = $lines[$ln]
