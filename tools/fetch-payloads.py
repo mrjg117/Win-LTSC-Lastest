@@ -33,6 +33,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -92,26 +93,49 @@ def http(url, data=None, timeout=TIMEOUT, retries=3):
     fail(f"请求失败（重试 {retries} 次）: {url} -- {last}")
 
 
-def download(url, path, expect_size=None):
-    """流式下载 + 落盘（原子重命名），失败即抛。"""
+def download(url, path, expect_size=None, retries=4):
+    """流式下载 + 落盘（原子重命名）。网络层带重试，最终仍失败则 fail() 并打印真实 URL。
+
+    原实现直接 urllib.request.urlopen 不带重试、无 try/except：任一瞬时网络抖动
+    （403/503/超时/连接重置）都会抛未捕获异常、整步崩掉、且 annotation 只剩光秃秃的
+    exit code 1（无 ::error:: 详情）。这里用指数退避重试，末次仍失败才 fail()，
+    并把真实出错的 URL 与末次错误打出来，让 CI annotation 直接可读、可定位。
+    """
     tmp = path + ".part"
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    total = 0
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as r, io.open(tmp, "wb") as f:
-        while True:
-            buf = r.read(1 << 20)
-            if not buf:
-                break
-            f.write(buf)
-            total += len(buf)
-    if total <= 0:
-        fail(f"下载到 0 字节: {url}")
-    os.replace(tmp, path)
-    if expect_size and abs(total - expect_size) > 1024:
-        log(f"WARN 大小与清单不符（{total} vs {expect_size}）: {os.path.basename(path)}")
-    log(f"OK {os.path.basename(path)}  {total/1048576:.1f} MB")
-    return total
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA})
+            total = 0
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r, io.open(tmp, "wb") as f:
+                while True:
+                    buf = r.read(1 << 20)
+                    if not buf:
+                        break
+                    f.write(buf)
+                    total += len(buf)
+            if total <= 0:
+                # 服务器返回空体：按可重试的瞬时错误处理，删掉 .part 后重试
+                raise IOError(f"下载到 0 字节: {url}")
+            os.replace(tmp, path)
+            if expect_size and abs(total - expect_size) > 1024:
+                log(f"WARN 大小与清单不符（{total} vs {expect_size}）: {os.path.basename(path)}")
+            log(f"OK {os.path.basename(path)}  {total/1048576:.1f} MB")
+            return total
+        except Exception as e:                       # noqa: BLE001 - 网络/IO 错误种类繁多，统一重试
+            last = e
+            # 失败则清掉半成品，避免残留 .part 干扰下次（落盘名不带 .part，不会被 SKIP 误判，
+            # 但清掉更干净，重跑直接重新下载）
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            log(f"WARN 第 {attempt}/{retries} 次下载失败 {url}: {e}")
+            if attempt < retries:
+                time.sleep(min(2 ** attempt, 30))     # 指数退避，封顶 30s
+    fail(f"下载失败（重试 {retries} 次）: {url} -- 末次错误: {last}")
 
 
 # ---------------- components ----------------

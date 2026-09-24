@@ -9,8 +9,9 @@
 #   . self/tools/cloud-upload.ps1
 #   Send-R2Upload   -Iso <path> -Tag <tag> -AccountId <x> -Bucket <b> -Region <r> -AccessKey <ak> -SecretKey <sk>
 #   Invoke-R2Prune  -Tag <tag> -AccountId <x> -Bucket <b> -Region <r> -AccessKey <ak> -SecretKey <sk> -Keep <n> -Edition <e>
-#   Send-SharePointUpload -Iso <path> -Tag <tag> -TenantId <t> -ClientId <c> -CertKeyPem <path> [-CertThumbprint <hex>] -SiteHost <host>
-#   Invoke-SharePointPrune -TenantId <t> -ClientId <c> -CertKeyPem <path> [-CertThumbprint <hex>] -SiteHost <host> -Keep <n> -Edition <e>
+#   Send-SharePointUpload -Iso <path> -Tag <tag> -TenantId <t> -ClientId <c> -CertKeyPem <path> [-CertThumbprint <hex>] [-CertPem <path>] -SiteHost <host> [-Path <rootFolder>]
+#   Invoke-SharePointPrune -TenantId <t> -ClientId <c> -CertKeyPem <path> [-CertThumbprint <hex>] [-CertPem <path>] -SiteHost <host> -Keep <n> -Edition <e>
+#   鉴权标识：CertThumbprint（hex 指纹）与 CertPem（X.509 公钥证书 PEM）任选其一——给了证书会自动算指纹并附 x5c。私钥(CertKeyPem)始终必填。
 #
 # 注意：pwsh 里 `curl` 是 Invoke-WebRequest 的别名，必须显式写 `curl.exe` 才能拿到二进制。
 
@@ -69,14 +70,34 @@ function Invoke-R2Prune {
 
 # ---------- Graph：应用证书 client_assertion 拿 token（app-only，无用户上下文）----------
 function Get-GraphToken {
-    param([string]$TenantId, [string]$ClientId, [string]$CertKeyPem, [string]$CertThumbprint)
+    param([string]$TenantId, [string]$ClientId, [string]$CertKeyPem, [string]$CertThumbprint, [string]$CertPem)
     $header = @{ alg = 'RS256'; typ = 'JWT' }
-    if ($CertThumbprint) {
-        # x5t = 证书 SHA1 指纹的 Base64Url（Entra 注册的 kid 必须匹配）
-        $hb = @()
-        for ($i = 0; $i -lt $CertThumbprint.Length; $i += 2) { $hb += [byte]::Parse($CertThumbprint.Substring($i, 2), 'HexNumber') }
-        $header.x5t = ConvertTo-Base64Url -Bytes $hb
+    # 公钥证书 / 指纹 任选其一：
+    #  - 给了完整证书(PEM)且没给指纹 → 从证书 DER 计算 SHA1 指纹（= Azure 显示的指纹），并附 x5c 供 Entra 按公钥匹配
+    #  - 给了指纹 → 直接用（原行为）
+    $x5c = $null
+    if ($CertPem -and (Test-Path $CertPem)) {
+        $pemContent = (Get-Content $CertPem -Raw).Trim()
+        if ($pemContent -ne '') {
+            $pemRaw = $pemContent -replace '-----BEGIN CERTIFICATE-----', '' `
+                -replace '-----END CERTIFICATE-----', '' -replace '\s+', ''
+            try { $der = [Convert]::FromBase64String($pemRaw) }
+            catch { throw "ONEDRIVE_CERT 不是合法的 X.509 PEM 证书: $_" }
+            if ($der.Length -eq 0) { throw "ONEDRIVE_CERT 解析后为空" }
+            $x5c = [Convert]::ToBase64String($der)
+            if (-not $CertThumbprint) {
+                $sha1 = [System.Security.Cryptography.SHA1]::Create()
+                $CertThumbprint = ($sha1.ComputeHash($der) | ForEach-Object { $_.ToString('x2') }) -join ''
+                Write-Host "由公钥证书推导出指纹: $CertThumbprint"
+            }
+        }
     }
+    if (-not $CertThumbprint) { throw "必须提供 ONEDRIVE_CERT_THUMBPRINT 或 ONEDRIVE_CERT 其中之一" }
+    # x5t = 证书 SHA1 指纹的 Base64Url（Entra 注册的 kid 必须匹配）
+    $hb = @()
+    for ($i = 0; $i -lt $CertThumbprint.Length; $i += 2) { $hb += [byte]::Parse($CertThumbprint.Substring($i, 2), 'HexNumber') }
+    $header.x5t = ConvertTo-Base64Url -Bytes $hb
+    if ($x5c) { $header.x5c = @($x5c) }
     $now = [DateTimeOffset]::UtcNow
     $iat = $now.ToUnixTimeSeconds()
     $claims = @{
@@ -124,17 +145,19 @@ function Resolve-SiteDrive {
 function Send-SharePointUpload {
     param(
         [string]$Iso, [string]$Tag, [string]$TenantId, [string]$ClientId,
-        [string]$CertKeyPem, [string]$CertThumbprint, [string]$SiteHost
+        [string]$CertKeyPem, [string]$CertThumbprint, [string]$CertPem, [string]$SiteHost,
+        [string]$Path = 'WinLTSC'
     )
-    $token = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -CertKeyPem $CertKeyPem -CertThumbprint $CertThumbprint
+    $token = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -CertKeyPem $CertKeyPem -CertThumbprint $CertThumbprint -CertPem $CertPem
     $siteId = Resolve-SiteDrive -Token $token -SiteHost $SiteHost
     $driveRoot = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive/root"
     $h = @{ Authorization = "Bearer $token" }
     $fileName = Split-Path $Iso -Leaf
-    # 路径段编码（WinLTSC/<tag>/<file>），用冒号可寻址语法拿 upload session
-    $seg = @('WinLTSC', $Tag, $fileName) | ForEach-Object { [System.Uri]::EscapeDataString($_) }
-    $drivePath = ($seg -join '/')
-    $createUrl = "$driveRoot/:$drivePath`:/createUploadSession"
+    # 路径段编码（<Path>/<tag>/<file>），用冒号可寻址语法拿 upload session
+    # Path 可含子路径（如 ISO/WinLTSC），按 / 拆段各自编码（slash 是 Graph 寻址分隔符，不能整体转义）
+    $prefixSegs = @($Path -split '/' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { [System.Uri]::EscapeDataString($_) })
+    $seg = ($prefixSegs + [System.Uri]::EscapeDataString($Tag) + [System.Uri]::EscapeDataString($fileName)) -join '/'
+    $createUrl = "$driveRoot/:$seg`:/createUploadSession"
     $sess = Invoke-RestMethod -Uri $createUrl -Method Post -Headers $h -Body '{}' -ContentType 'application/json'
 
     # 切片 = 5MiB，必须是 320KiB(327680) 的整数倍：5*1024*1024 / 327680 = 16.0 ✔
@@ -161,19 +184,21 @@ function Send-SharePointUpload {
             Write-Host ("SharePoint 上传进度: {0:0.0}%" -f (100.0 * $start / $total))
         }
     } finally { $fs.Close() }
-    Write-Host "SharePoint 上传完成: WinLTSC/$Tag/$fileName"
+    Write-Host "SharePoint 上传完成: $Path/$Tag/$fileName"
 }
 
 # ---------- SharePoint：列举 + 删除（prune，保留 KEEP 个）----------
 function Invoke-SharePointPrune {
     param(
-        [string]$TenantId, [string]$ClientId, [string]$CertKeyPem, [string]$CertThumbprint,
-        [string]$SiteHost, [int]$Keep, [string]$Edition
+        [string]$TenantId, [string]$ClientId, [string]$CertKeyPem, [string]$CertThumbprint, [string]$CertPem,
+        [string]$SiteHost, [int]$Keep, [string]$Edition,
+        [string]$Path = 'WinLTSC'
     )
-    $token = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -CertKeyPem $CertKeyPem -CertThumbprint $CertThumbprint
+    $token = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -CertKeyPem $CertKeyPem -CertThumbprint $CertThumbprint -CertPem $CertPem
     $siteId = Resolve-SiteDrive -Token $token -SiteHost $SiteHost
     $h = @{ Authorization = "Bearer $token" }
-    $root = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive/root:/WinLTSC:/children"
+    $pathSegs = @($Path -split '/' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { [System.Uri]::EscapeDataString($_) })
+    $root = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive/root:/$(($pathSegs -join '/')):/children"
     $r = Invoke-RestMethod -Uri $root -Headers $h -Method Get
     # 目录名形如 <date>-<ubr>-<edition>；按名降序，Skip Keep 删最旧
     $folders = @($r.value | Where-Object { $_.folder -and $_.name -like "*-$Edition" } | Sort-Object name -Descending)
