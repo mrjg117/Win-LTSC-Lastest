@@ -37,6 +37,10 @@ on:
         description: "SharePoint 保留版本数"
         type: number
         default: 2
+      onedrive_path:
+        description: "SharePoint 文档库内根文件夹（可含子路径，如 ISO/WinLTSC；留空=文档库根）"
+        type: string
+        default: WinLTSC
   repository_dispatch:
     types: [build-by-update]
   schedule:
@@ -109,6 +113,7 @@ jobs:
       KEEP_RELEASE: ${{ (github.event_name == 'workflow_dispatch' && inputs.keep_release) || (github.event_name == 'repository_dispatch' && github.event.client_payload.keep_release) || 3 }}
       KEEP_R2: ${{ (github.event_name == 'workflow_dispatch' && inputs.keep_r2) || (github.event_name == 'repository_dispatch' && github.event.client_payload.keep_r2) || 1 }}
       KEEP_ONEDRIVE: ${{ (github.event_name == 'workflow_dispatch' && inputs.keep_onedrive) || (github.event_name == 'repository_dispatch' && github.event.client_payload.keep_onedrive) || 2 }}
+      OD_PATH: ${{ (github.event_name == 'workflow_dispatch' && inputs.onedrive_path) || (github.event_name == 'repository_dispatch' && github.event.client_payload.onedrive_path) || 'WinLTSC' }}
 
     steps:
       - name: Checkout 本仓库（delta + 配置 + tools）
@@ -535,14 +540,18 @@ jobs:
           OD_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
           OD_CERT_THUMBPRINT: ${{ secrets.ONEDRIVE_CERT_THUMBPRINT }}
           OD_CERT_KEY: ${{ secrets.ONEDRIVE_CERT_KEY }}
+          OD_CERT: ${{ secrets.ONEDRIVE_CERT }}
           OD_SITE_HOST: ${{ secrets.ONEDRIVE_SITE_HOST }}
         run: |
           $keyPath = "$env:RUNNER_TEMP\onedrive_key.pem"
           Set-Content -Path $keyPath -Value $env:OD_CERT_KEY -NoNewline
+          $certPath = "$env:RUNNER_TEMP\onedrive_cert.pem"
+          if ($env:OD_CERT) { Set-Content -Path $certPath -Value $env:OD_CERT -NoNewline }
           . self/tools/cloud-upload.ps1
           Send-SharePointUpload -Iso "src\out\$env:ISO_BASE.iso" -Tag $env:TAG `
             -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
-            -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -SiteHost $env:OD_SITE_HOST
+            -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
+            -Path $env:OD_PATH
 
       - name: prune Release（保留 KEEP_RELEASE 个）
         if: env.DO_RELEASE == 'true'
@@ -588,12 +597,15 @@ jobs:
           OD_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
           OD_CERT_THUMBPRINT: ${{ secrets.ONEDRIVE_CERT_THUMBPRINT }}
           OD_CERT_KEY: ${{ secrets.ONEDRIVE_CERT_KEY }}
+          OD_CERT: ${{ secrets.ONEDRIVE_CERT }}
           OD_SITE_HOST: ${{ secrets.ONEDRIVE_SITE_HOST }}
           KEEP: ${{ env.KEEP_ONEDRIVE }}
         run: |
           $keyPath = "$env:RUNNER_TEMP\onedrive_key.pem"
           Set-Content -Path $keyPath -Value $env:OD_CERT_KEY -NoNewline
+          $certPath = "$env:RUNNER_TEMP\onedrive_cert.pem"
+          if ($env:OD_CERT) { Set-Content -Path $certPath -Value $env:OD_CERT -NoNewline }
           . self/tools/cloud-upload.ps1
           Invoke-SharePointPrune -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
-            -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -SiteHost $env:OD_SITE_HOST `
-            -Keep ([int]$env:KEEP) -Edition $env:EDITION
+            -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
+            -Keep ([int]$env:KEEP) -Edition $env:EDITION -Path $env:OD_PATH
