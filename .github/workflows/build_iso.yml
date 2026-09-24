@@ -41,6 +41,18 @@ on:
         description: "SharePoint 文档库内根文件夹（可含子路径，如 ISO/WinLTSC；留空=文档库根）"
         type: string
         default: WinLTSC
+      release_chunk:
+        description: "Release 分片大小（GB，按此切；填多少切多少；务必 < 2GB 单文件硬上限）"
+        type: string
+        default: "1.9"
+      r2_chunk:
+        description: "R2(S3类) 分片大小（GB；每片单 PUT，务必 < 5GB 单 PUT 硬上限；填多少切多少）"
+        type: string
+        default: "4.9"
+      onedrive_chunk:
+        description: "OneDrive/SharePoint 分片大小（GB；≥ ISO 则不切、单文件上传；填多少切多少）"
+        type: string
+        default: "99"
   repository_dispatch:
     types: [build-by-update]
   schedule:
@@ -114,6 +126,9 @@ jobs:
       KEEP_R2: ${{ (github.event_name == 'workflow_dispatch' && inputs.keep_r2) || (github.event_name == 'repository_dispatch' && github.event.client_payload.keep_r2) || 1 }}
       KEEP_ONEDRIVE: ${{ (github.event_name == 'workflow_dispatch' && inputs.keep_onedrive) || (github.event_name == 'repository_dispatch' && github.event.client_payload.keep_onedrive) || 2 }}
       OD_PATH: ${{ (github.event_name == 'workflow_dispatch' && inputs.onedrive_path) || (github.event_name == 'repository_dispatch' && github.event.client_payload.onedrive_path) || 'WinLTSC' }}
+      RELEASE_CHUNK: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_chunk) || (github.event_name == 'repository_dispatch' && github.event.client_payload.release_chunk) || '1.9' }}
+      R2_CHUNK: ${{ (github.event_name == 'workflow_dispatch' && inputs.r2_chunk) || (github.event_name == 'repository_dispatch' && github.event.client_payload.r2_chunk) || '4.9' }}
+      OD_CHUNK: ${{ (github.event_name == 'workflow_dispatch' && inputs.onedrive_chunk) || (github.event_name == 'repository_dispatch' && github.event.client_payload.onedrive_chunk) || '99' }}
 
     steps:
       - name: Checkout 本仓库（delta + 配置 + tools）
@@ -433,14 +448,10 @@ jobs:
             Write-Host "Release $tag 已创建: $(gh release view "$tag" --repo $repo --json url --jq .url)"
           }
 
-      - name: 重命名 + RAW 切分上传 ISO（≤1.9GiB/片，上岸即删）+ 生成 merge.cmd
-        if: env.DO_RELEASE == 'true' && env.SKIP != '1'
+      - name: 准备最终 ISO + 计算 SHA256（供 Release / R2 / OneDrive 各通道复用）
+        if: env.SKIP != '1'
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $repo = "${{ github.repository }}"
-          # [关键] Patch.cmd 在 src/ 下执行，产物落在 src/out/WinLTSC-<branch>.iso；本步工作目录是仓库根，必须带 src/ 前缀
           $isoPath = "src/out/WinLTSC-${{ matrix.branch }}.iso"
           if (-not (Test-Path $isoPath)) {
             Write-Host "src 下的 out 目录内容："
@@ -455,11 +466,28 @@ jobs:
           Write-Host ("最终 ISO: {0}  {1:N2} GB（{2:N0} 字节）" -f $iso.Name, ($size / 1GB), $size)
           Write-Host ("SHA256 计算中（{0:N2} GB）…" -f ($size / 1GB))
           $t0 = Get-Date
-          $hash = (Get-FileHash $finalIso -Algorithm SHA256).Hash
+          $hash = (Get-FileHash $finalIso -Algorithm SHA256).Hash.ToUpper()
           Write-Host ("ISO SHA256 = {0}（用时 {1:N1}s）" -f $hash, ((Get-Date) - $t0).TotalSeconds)
-          # 逐片生成 -> 上传 -> 立即删除，避免 ISO(7.9GB)+全部分片(~7.9GB) 同时占盘撑爆 runner
-          $chunk = 1900L * 1024L * 1024L
-          Write-Host ("按 {0:N0} MB/片切分，预计 {1} 片" -f ($chunk / 1MB), [math]::Ceiling($size / $chunk))
+          # 导出给后续 R2 / OneDrive 通道复用，避免重复算哈希与各通道重复切分
+          echo "ISO_SHA256=$hash" >> $env:GITHUB_ENV
+
+      - name: 重命名 + RAW 切分上传 ISO（按 RELEASE_CHUNK GB/片，上岸即删）+ 生成 merge.cmd
+        if: env.DO_RELEASE == 'true' && env.SKIP != '1'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $repo = "${{ github.repository }}"
+          $isoBase = $env:ISO_BASE
+          $finalIso = "src/out/$isoBase.iso"
+          if (-not (Test-Path $finalIso)) { throw "最终 ISO 未生成：$finalIso" }
+          $iso = Get-Item $finalIso
+          $size = $iso.Length
+          $hash = $env:ISO_SHA256
+          # Release 单文件硬上限 2 GiB；分片必须严格小于它，否则 GitHub 直接拒收
+          $chunk = [long]([double]$env:RELEASE_CHUNK * 1e9)
+          if ($chunk -ge 2147483648) { throw "RELEASE_CHUNK 必须 < 2（GitHub Release 单文件硬上限 2GiB），当前 $($env:RELEASE_CHUNK) GB" }
+          Write-Host ("Release 按 {0:N0} MB/片切分（RELEASE_CHUNK={1} GB），预计 {2} 片" -f ($chunk / 1MB), $env:RELEASE_CHUNK, [math]::Ceiling($size / $chunk))
           $buf = New-Object byte[] (16777216)
           New-Item -ItemType Directory -Force -Path out | Out-Null
           $idx = 1
@@ -498,7 +526,7 @@ jobs:
           if ($count -ne $expected) { throw "片数校验失败：期望 $expected 片，实际 $count 片" }
           # 生成 merge.cmd（内嵌本 ISO 期望哈希）并上传
           $tpl = Get-Content self/assets/release/merge.cmd -Raw
-          $expLine = 'set "EXP_' + $isoBase + '.iso=' + $hash.ToUpper() + '"'
+          $expLine = 'set "EXP_' + $isoBase + '.iso=' + $hash + '"'
           Write-Host "merge.cmd 内嵌期望哈希行：$expLine"
           $tpl = $tpl -replace '(?s)(REM ===EXPECTED_HASHES_START===).*?(REM ===EXPECTED_HASHES_END===)', ('$1' + [Environment]::NewLine + $expLine + [Environment]::NewLine + '$2')
           Set-Content -Path "out/merge.cmd" -Value $tpl -NoNewline
@@ -511,13 +539,9 @@ jobs:
           Write-Host "Release 上的 part 资产数：$($assets.Count)（期望 $expected）"
           if ($assets.Count -lt $expected) { throw "Release 资产缺失：期望 $expected 个 part，实际 $($assets.Count) 个" }
           Write-Host "Release URL: $(gh release view "$env:TAG" --repo $repo --json url --jq .url)"
-          # R2 / SharePoint 通道若开启则需保留 ISO；否则删掉释放磁盘
-          if ($env:DO_R2 -ne 'true' -and $env:DO_ONEDRIVE -ne 'true') {
-            Remove-Item $finalIso -Force
-            Write-Host "已删除本地 ISO，释放 $([math]::Round($size/1GB,2)) GB"
-          }
+          # 本地最终 ISO 保留到所有通道上传完毕，由末尾清理步统一删除
 
-      - name: 上传 R2（S3 直传，curl --aws-sigv4，无 rclone）
+      - name: 上传 R2（按 R2_CHUNK GB 分片，每片单 PUT + 生成 merge.cmd）
         if: env.DO_R2 == 'true' && env.SKIP != '1'
         shell: pwsh
         env:
@@ -527,12 +551,56 @@ jobs:
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           R2_REGION: ${{ secrets.R2_REGION || 'auto' }}
         run: |
+          $isoBase = $env:ISO_BASE
+          $finalIso = "src/out/$isoBase.iso"
+          if (-not (Test-Path $finalIso)) { throw "最终 ISO 未生成：$finalIso" }
+          $size = (Get-Item $finalIso).Length
+          # R2/S3 单 PUT 硬上限 5 GiB；分片必须 < 5GiB，否则 EntityTooLarge
+          $chunk = [long]([double]$env:R2_CHUNK * 1e9)
+          if ($chunk -ge 5368709120) { throw "R2_CHUNK 必须 < 5（R2/S3 单 PUT 硬上限 5GiB），当前 $($env:R2_CHUNK) GB" }
+          Write-Host ("R2 按 {0:N0} MB/片切分（R2_CHUNK={1} GB），预计 {2} 片" -f ($chunk / 1MB), $env:R2_CHUNK, [math]::Ceiling($size / $chunk))
           . self/tools/cloud-upload.ps1
-          Send-R2Upload -Iso "src\out\$env:ISO_BASE.iso" -Tag $env:TAG `
+          $buf = New-Object byte[] (16777216)
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          $idx = 1
+          $fs = [System.IO.File]::OpenRead($finalIso)
+          try {
+            while ($fs.Position -lt $size) {
+              $name = "out/$isoBase.iso.part$idx"
+              $out = [System.IO.File]::Create($name)
+              try {
+                $written = 0L
+                while ($written -lt $chunk -and $fs.Position -lt $size) {
+                  $toRead = [int][Math]::Min([long]$buf.Length, $chunk - $written)
+                  $n = $fs.Read($buf, 0, $toRead)
+                  if ($n -le 0) { break }
+                  $out.Write($buf, 0, $n)
+                  $written += $n
+                }
+              } finally { $out.Close() }
+              Write-Host ("R2 上传 {0}（{1:N1} MB）" -f $name, ($written / 1MB))
+              Send-R2Upload -Iso $name -Tag $env:TAG `
+                -AccountId $env:R2_ACCOUNT_ID -Bucket $env:R2_BUCKET -Region $env:R2_REGION `
+                -AccessKey $env:R2_ACCESS_KEY_ID -SecretKey $env:R2_SECRET_ACCESS_KEY
+              Remove-Item $name -Force
+              $idx++
+            }
+          } finally { $fs.Close() }
+          $count = $idx - 1
+          $expected = [math]::Ceiling($size / $chunk)
+          if ($count -ne $expected) { throw "R2 片数校验失败：期望 $expected 片，实际 $count 片" }
+          # 生成 merge.cmd 并上传到 $Tag/ 下，便于下载后本地重组校验
+          $tpl = Get-Content self/assets/release/merge.cmd -Raw
+          $expLine = 'set "EXP_' + $isoBase + '.iso=' + $env:ISO_SHA256 + '"'
+          $tpl = $tpl -replace '(?s)(REM ===EXPECTED_HASHES_START===).*?(REM ===EXPECTED_HASHES_END===)', ('$1' + [Environment]::NewLine + $expLine + [Environment]::NewLine + '$2')
+          Set-Content -Path "out/merge.cmd" -Value $tpl -NoNewline
+          Send-R2Upload -Iso "out/merge.cmd" -Tag $env:TAG `
             -AccountId $env:R2_ACCOUNT_ID -Bucket $env:R2_BUCKET -Region $env:R2_REGION `
             -AccessKey $env:R2_ACCESS_KEY_ID -SecretKey $env:R2_SECRET_ACCESS_KEY
+          Remove-Item "out/merge.cmd" -Force
+          Write-Host "R2 上传完成：$count 片 + merge.cmd"
 
-      - name: 上传 SharePoint（默认站点/默认文档库，Graph 证书直传 upload session，无 rclone）
+      - name: 上传 SharePoint（按 OD_CHUNK GB 分片 / 单文件，生成 merge.cmd）
         if: env.DO_ONEDRIVE == 'true' && env.SKIP != '1'
         shell: pwsh
         env:
@@ -548,10 +616,73 @@ jobs:
           $certPath = "$env:RUNNER_TEMP\onedrive_cert.pem"
           if ($env:OD_CERT) { Set-Content -Path $certPath -Value $env:OD_CERT -NoNewline }
           . self/tools/cloud-upload.ps1
-          Send-SharePointUpload -Iso "src\out\$env:ISO_BASE.iso" -Tag $env:TAG `
-            -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
-            -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
-            -Path $env:OD_PATH
+          $isoBase = $env:ISO_BASE
+          $finalIso = "src/out/$isoBase.iso"
+          if (-not (Test-Path $finalIso)) { throw "最终 ISO 未生成：$finalIso" }
+          $size = (Get-Item $finalIso).Length
+          $chunk = [long]([double]$env:OD_CHUNK * 1e9)
+          if ($size -le $chunk) {
+            # OD_CHUNK >= ISO → 不切，单文件走 upload session（OneDrive 原生支持到 250GB）
+            # 单文件也附 merge.cmd：下载端可独立校验 SHA256（不再"无哈希保护"）
+            Write-Host ("OneDrive：OD_CHUNK={0} GB >= ISO {1:N2} GB，单文件上传（不切分，仍附 merge.cmd 供哈希校验）" -f $env:OD_CHUNK, ($size / 1GB))
+            Send-SharePointUpload -Iso $finalIso -Tag $env:TAG `
+              -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
+              -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
+              -Path $env:OD_PATH
+            $tpl = Get-Content self/assets/release/merge.cmd -Raw
+            $expLine = 'set "EXP_' + $isoBase + '.iso=' + $env:ISO_SHA256 + '"'
+            $tpl = $tpl -replace '(?s)(REM ===EXPECTED_HASHES_START===).*?(REM ===EXPECTED_HASHES_END===)', ('$1' + [Environment]::NewLine + $expLine + [Environment]::NewLine + '$2')
+            Set-Content -Path "out/merge.cmd" -Value $tpl -NoNewline
+            Send-SharePointUpload -Iso "out/merge.cmd" -Tag $env:TAG `
+              -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
+              -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
+              -Path $env:OD_PATH
+            Remove-Item "out/merge.cmd" -Force
+            Write-Host "OneDrive 单文件上传完成：1 个 ISO + merge.cmd"
+          } else {
+            # OD_CHUNK < ISO → 按片切分，每片走 upload session，并附 merge.cmd
+            Write-Host ("OneDrive 按 {0:N0} MB/片切分（OD_CHUNK={1} GB），预计 {2} 片" -f ($chunk / 1MB), $env:OD_CHUNK, [math]::Ceiling($size / $chunk))
+            $buf = New-Object byte[] (16777216)
+            New-Item -ItemType Directory -Force -Path out | Out-Null
+            $idx = 1
+            $fs = [System.IO.File]::OpenRead($finalIso)
+            try {
+              while ($fs.Position -lt $size) {
+                $name = "out/$isoBase.iso.part$idx"
+                $out = [System.IO.File]::Create($name)
+                try {
+                  $written = 0L
+                  while ($written -lt $chunk -and $fs.Position -lt $size) {
+                    $toRead = [int][Math]::Min([long]$buf.Length, $chunk - $written)
+                    $n = $fs.Read($buf, 0, $toRead)
+                    if ($n -le 0) { break }
+                    $out.Write($buf, 0, $n)
+                    $written += $n
+                  }
+                } finally { $out.Close() }
+                Write-Host ("OneDrive 上传 {0}（{1:N1} MB）" -f $name, ($written / 1MB))
+                Send-SharePointUpload -Iso $name -Tag $env:TAG `
+                  -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
+                  -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
+                  -Path $env:OD_PATH
+                Remove-Item $name -Force
+                $idx++
+              }
+            } finally { $fs.Close() }
+            $count = $idx - 1
+            $expected = [math]::Ceiling($size / $chunk)
+            if ($count -ne $expected) { throw "OneDrive 片数校验失败：期望 $expected 片，实际 $count 片" }
+            $tpl = Get-Content self/assets/release/merge.cmd -Raw
+            $expLine = 'set "EXP_' + $isoBase + '.iso=' + $env:ISO_SHA256 + '"'
+            $tpl = $tpl -replace '(?s)(REM ===EXPECTED_HASHES_START===).*?(REM ===EXPECTED_HASHES_END===)', ('$1' + [Environment]::NewLine + $expLine + [Environment]::NewLine + '$2')
+            Set-Content -Path "out/merge.cmd" -Value $tpl -NoNewline
+            Send-SharePointUpload -Iso "out/merge.cmd" -Tag $env:TAG `
+              -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
+              -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
+              -Path $env:OD_PATH
+            Remove-Item "out/merge.cmd" -Force
+            Write-Host "OneDrive 上传完成：$count 片 + merge.cmd"
+          }
 
       - name: prune Release（保留 KEEP_RELEASE 个）
         if: env.DO_RELEASE == 'true'
@@ -609,3 +740,14 @@ jobs:
           Invoke-SharePointPrune -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
             -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
             -Keep ([int]$env:KEEP) -Edition $env:EDITION -Path $env:OD_PATH
+
+      - name: 清理本地最终 ISO（各通道均已上传完毕，释放磁盘）
+        if: env.SKIP != '1'
+        shell: pwsh
+        run: |
+          $p = "src/out/$($env:ISO_BASE).iso"
+          if (Test-Path $p) {
+            $gb = [math]::Round((Get-Item $p).Length / 1GB, 2)
+            Remove-Item $p -Force
+            Write-Host "已删除本地最终 ISO，释放 $gb GB"
+          } else { Write-Host "本地最终 ISO 已不存在，无需清理" }
