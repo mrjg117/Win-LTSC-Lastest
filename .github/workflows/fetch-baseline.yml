@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 360
     steps:
       - name: Checkout（config.yml + assets/release/merge.cmd 模板）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: 安装 aria2
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends aria2

@@ -142,10 +142,41 @@ function Resolve-SiteDrive {
     return $site.id   # 站点 id，用于 /sites/{id}/drive
 }
 
+# ---------- SharePoint：确保目标目录存在（幂等）----------
+# createUploadSession 按路径寻址时【不会自动建父目录】，父目录缺失直接 400 invalidRequest
+# （本仓 run 36292555261、36305285789 两次真实失败均为此根因：OD_PATH 未确认存在于目标 drive）。
+# 仅针对用户给定的 OD_PATH（仓库 Secret ONEDRIVE_PATH），逐段 GET 探测、缺失则建；已存在直接跳过。
+# 绝不发明任何额外子目录（如 <tag>）。
+function Ensure-SharePointFolder {
+    param([string]$DriveRoot, [string]$Token, [string]$RelativePath)
+    $h = @{ Authorization = "Bearer $Token" }
+    $segs = @($RelativePath -split '/' | Where-Object { $_.Trim() -ne '' })
+    $acc = ''
+    foreach ($seg in $segs) {
+        $enc = [System.Uri]::EscapeDataString($seg)
+        $addr = if ($acc -eq '') { "$DriveRoot/:$enc`:" } else { "$DriveRoot/:$acc/$enc`:" }
+        $exists = $false
+        try { Invoke-RestMethod -Uri $addr -Headers $h -Method Get -ErrorAction Stop | Out-Null; $exists = $true } catch { $exists = $false }
+        if (-not $exists) {
+            $parentChildren = if ($acc -eq '') { "$DriveRoot/children" } else { "$DriveRoot/:$acc`:/children" }
+            $body = (@{ name = $seg; folder = @{} } | ConvertTo-Json -Compress)
+            try {
+                Invoke-RestMethod -Uri $parentChildren -Headers $h -Method Post -Body $body -ContentType 'application/json' -ErrorAction Stop | Out-Null
+                Write-Host "SharePoint: 创建目录 $seg (父路径=$acc)"
+            } catch {
+                # 并发/已存在可能 409；再 GET 确认，存在即视为成功
+                $recheck = $false
+                try { Invoke-RestMethod -Uri $addr -Headers $h -Method Get -ErrorAction Stop | Out-Null; $recheck = $true } catch {}
+                if (-not $recheck) { throw $_ }
+            }
+        }
+        $acc = if ($acc -eq '') { $seg } else { "$acc/$seg" }
+    }
+}
+
 # ---------- SharePoint：可续传 upload session 上传大文件 ----------
-# 目标路径 = OD_PATH（仓库 Secret ONEDRIVE_PATH，未设回退 WinLTSC）/<文件名>
-# 平铺存放，不再额外拼 <tag> 子目录：文件名本身已含日期+UBR（如 <stem>_260927_19041），足以区分构建；
-# 且 OneDrive/SharePoint 的 createUploadSession 不会自动建父目录，多拼一层不存在的子目录会 400 invalidRequest。
+# 目标路径 = OD_PATH（仓库 Secret ONEDRIVE_PATH）/<文件名>，平铺存放，不拼 <tag> 子目录。
+# 文件名本身已含日期+UBR，足以区分构建。上传前先 Ensure-SharePointFolder 确认 OD_PATH 存在。
 function Send-SharePointUpload {
     param(
         [string]$Iso, [string]$TenantId, [string]$ClientId,
@@ -156,13 +187,17 @@ function Send-SharePointUpload {
     $siteId = Resolve-SiteDrive -Token $token -SiteHost $SiteHost
     $driveRoot = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive/root"
     $h = @{ Authorization = "Bearer $token" }
+    # 确认 OD_PATH 父目录存在（不存在则建；这是 createUploadSession 不报 400 的前提）
+    Ensure-SharePointFolder -DriveRoot $driveRoot -Token $token -RelativePath $Path
     $fileName = Split-Path $Iso -Leaf
     # 路径段编码（<Path>/<file>）：直接用 OD_PATH 作目标目录，文件落在其下
     # Path 可含子路径（如 ISO/WinLTSC），按 / 拆段各自编码（slash 是 Graph 寻址分隔符，不能整体转义）
     $prefixSegs = @($Path -split '/' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { [System.Uri]::EscapeDataString($_) })
     $seg = ($prefixSegs + [System.Uri]::EscapeDataString($fileName)) -join '/'
     $createUrl = "$driveRoot/:$seg`:/createUploadSession"
-    $sess = Invoke-RestMethod -Uri $createUrl -Method Post -Headers $h -Body '{}' -ContentType 'application/json'
+    # conflictBehavior=replace：目标文件若存在则覆盖（避免"已存在"误报 invalidRequest）
+    $sessBody = (@{ '@microsoft.graph.conflictBehavior' = 'replace' } | ConvertTo-Json -Compress)
+    $sess = Invoke-RestMethod -Uri $createUrl -Method Post -Headers $h -Body $sessBody -ContentType 'application/json'
 
     # 切片 = 5MiB，必须是 320KiB(327680) 的整数倍：5*1024*1024 / 327680 = 16.0 ✔
     $chunkSize = 5 * 1024 * 1024
@@ -203,6 +238,8 @@ function Invoke-SharePointPrune {
     $token = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -CertKeyPem $CertKeyPem -CertThumbprint $CertThumbprint -CertPem $CertPem
     $siteId = Resolve-SiteDrive -Token $token -SiteHost $SiteHost
     $h = @{ Authorization = "Bearer $token" }
+    # 确认 OD_PATH 存在（否则下方列举会 404）；不存在则建
+    Ensure-SharePointFolder -DriveRoot "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive/root" -Token $token -RelativePath $Path
     $pathSegs = @($Path -split '/' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { [System.Uri]::EscapeDataString($_) })
     $root = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive/root:/$(($pathSegs -join '/')):/children"
     $r = Invoke-RestMethod -Uri $root -Headers $h -Method Get

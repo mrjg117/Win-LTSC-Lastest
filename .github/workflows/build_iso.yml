@@ -35,7 +35,7 @@ jobs:
       matrix: ${{ steps.p.outputs.matrix }}
     steps:
       - name: Checkout（config.yml + tools/）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: 解析 config.yml -> config.json（唯一控制面板只解析一次，顺带结构性校验）
         run: |
@@ -66,7 +66,7 @@ jobs:
           PY
 
       - name: 上传 config.json（供 build 任务读取）
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: config-json
           path: config.json
@@ -103,17 +103,17 @@ jobs:
 
     steps:
       - name: Checkout 本仓库（delta + 配置 + tools）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           path: self
 
       - name: 准备 Python（抓取载荷用）
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.12"
 
       - name: 取回 config.json（plan 任务产出；Linux 侧已解析并校验过）
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.1
         with:
           name: config-json
           path: self
@@ -364,7 +364,7 @@ jobs:
         # 该步与本 job 其它步骤相互独立：只在前面失败/取消时执行。
         # src\logs\ 里是 Patch.cmd + 各 lib\*.ps1 的完整日志；runner 销毁后只此一份。
         if: failure() || cancelled()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: patch-logs-branch${{ matrix.branch }}
           path: src/logs/
