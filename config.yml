@@ -9,8 +9,7 @@
 
 # ---- 源镜像：一行一条，产物份数 = 条数 ----
 baseline:
-  chunk_mib: 1900                     # 每片上限(MiB)，留余量避开 GitHub 2GB 资产上限
-  threads: 16                         # 下载并发连接数（aria2 -x/-s）。嫌慢改 32，别处不用动。
+  # 分片大小 / 下载并发数已移到 .github/workflows/fetch-baseline.yml 的 env（只影响下载切分，不参与镜像烘焙）
   # sources 规则：
   #   * 文件名 = URL 末段（就是微软原版名，即契约命名）。分片名 <名>.partN、merge.cmd 的
   #     EXP_<名> 键、成品 ISO 名全部由它派生 —— URL 末段必须就是最终要的名字。
@@ -25,31 +24,26 @@ baseline:
       sha256: C117C5DDBC51F315C739F9321D4907FA50090BA7B48E7E9A2D173D49EF2F73A3
 
 # ---- 组件精简：写了就卸，注释掉 / 不写 = 保留 ----
-# 这一张表对**所有分支**生效。某分支要多卸几项，写进 branches.<b>.remove，脚本合并去重。
-# 名字形态由脚本自动分流；不匹配任何形态即报错退出（不静默跳过）：
-#   含 ~~~~          → 按 Capability 卸载（如 XPS.Viewer~~~~0.0.1.0）
-#   以 -Package 结尾  → 按 Package 卸载
-#   其余             → 按 Optional Feature 关闭
+# 名字形态由 05.Patch-Components.ps1 自动分流（与 tools/config-to-json.py 的 check_remove_name 一致）：
+#   含 ~~~~          → /Remove-Capability（镜像里没装/不存在 = SKIP，不报错）
+#   以 -Package 结尾  → /Remove-Package（已被后续 LCU 取代/不存在 = SKIP）
+#   其余             → /Disable-Feature /Remove（找不到/已禁用 = WARN，不致命）
+# 只列「可逆、不影响核心功能」的项。
+#   ⚠ WOW64 / 32 位子系统整层不碰：32 位 powershell.exe 是 WOW64 的一部分，没有独立的
+#     "移除 32 位 PS"能力；卸掉整个 WOW64 会让海量安装器/老程序崩溃，风险远大于收益，故不动。
 remove:
-  # ===== 能力（Capability，名字含 ~~~~）=====
-  - XPS.Viewer~~~~0.0.1.0          # XPS 文档查看器
-  - App.StepsRecorder~~~~0.0.1.0   # 步骤记录器（psr.exe）
-  - QuickAssist~~~~0.0.1.0         # 快速助手（远程协助）
-  # ===== 包（Package，以 -Package 结尾）=====
-  - Microsoft-Windows-CameraBarcodeScanner-Package   # 相机条码扫描器
-  - Microsoft-Windows-USBFunction-Package            # USB 设备（MTP）功能角色
-  - Microsoft-Windows-NetworkMobileHandlers-Package   # 移动网络（手机网络）处理
-  - Microsoft-Windows-DesktopFileExplorer-Package     # ⚠ 桌面文件资源管理器：删后仅剩 UWP 管理器，原配置即如此，慎用
-  - Microsoft-Windows-UEV-Package                    # 用户体验虚拟化（UE-V）
-  - Microsoft-Windows-LegacyWordbreaker-Package       # 旧版断字（西文排版）
-  - Microsoft-Windows-BootEnvironment-Dvd-Package     # 从 DVD 启动的引导环境
-  - Microsoft-Windows-3DAudio-HRTFData-Package        # 3D 音频 HRTF 数据
+  # ===== Capability：弃用但默认还在的编辑器 =====
+  - Microsoft.Windows.PowerShell.ISE~~~~0.0.1.0   # PowerShell ISE 图形脚本编辑器（已弃用；pwsh / powershell 控制台完全不受影响）
+  # ===== Optional Feature：可反向 Enable-WindowsOptionalFeature 恢复的传统桌面应用 =====
+  - WindowsMediaPlayer                          # 旧版 WMP 传统桌面应用（只关它，不动 Media Feature Pack / Media Foundation；Edge/照片/相机/语音输入不坏）
+  - Internet-Explorer-Optional-amd64            # IE11（24H2 已默认移除→本项在该分支仅 WARN；2021 仍带→关闭）。关掉不影响 Edge / 系统更新 / 核心联网；要兼容老站点用 Edge 的 IE 模式
 
 # ---- 每分支构建目标 ----
 branches:
   "26100":
     label: Win11-LTSC-2024            # → 产物标签 <YYMMDD>-<UBR>-Win11
     edition: IoTEnterpriseS           # 构建时 Dism /Set-Edition 到此 SKU（密钥查下方 gvlk 表）
+    retail_key: CGK42-GYN6Y-VD22B-BX98W-J8JXD   # IoT Enterprise LTSC 2024 零售密钥（MAS HWID 用的那把；转版本后换上，重装自动领数字权利）
     family: [26100, 26200, 26300]     # 允许的 build 家族（上游可能装"版本启用包"，build 会跳）
     # detect：check-updates 用它去 Update Catalog 搜「微软为本产品最新发了什么」。
     #   刻意用产品名而不是 build 号 —— 按 build 号搜会把 Server 版同名 build 混进来
@@ -69,13 +63,11 @@ branches:
   "19044":
     label: Win10-LTSC-2021
     edition: IoTEnterpriseS
+    retail_key: QPM6N-7J2WJ-P88HH-P3YRH-YY74H   # IoT Enterprise LTSC 2021 零售密钥（MAS HWID 用的那把；转版本后换上，重装自动领数字权利）
     family: [19041, 19042, 19043, 19044, 19045]
     # detect：同上。Win10 的 Catalog 结果里没有 build 号（Version 列是 n/a），
     #   所以只能按产品名认，比较"最新一次的发布日期"而不是 build 号。
     detect: Windows 10 Version 21H2
-    remove:
-      - MicrosoftWindowsPowerShellV2
-      - MicrosoftWindowsPowerShellV2Root
     # 应用与全局 apps 合并去重，写法与 26100 分支相同。
     apps:
       # [实测推翻旧结论] 曾以为"新版 MSIX 的 MinVersion 钉 Windows 11，Win10 装不上"。
@@ -86,9 +78,24 @@ branches:
       #   MinVersion 10.0.14393 / 10.0.16299）；只有在新包被下架时才需要回退到它们。
 
 # ---- SKU 转换用的 KMS GVLK（微软官方文档所列，一般不用改）----
+# 只用 IoTEnterpriseS：烘焙时 DISM /Set-Edition 把它转成「IoT Enterprise LTSC」SKU；
+# 首启你手动跑 MAS（C:\Tools\激活系统.cmd）按 KMS38 拿到硬件绑定的长期激活。
+# 因为烤进去的 K 就是 IoT 这个，以后重装只要同一份 K 在场（同 SKU），Windows 凭 KMS38
+# 硬件绑定自动续期激活，无需再跑 MAS —— 这正是你要的"K 匹配即自动激活"。
+# （原 EnterpriseS 是「普通 Enterprise LTSC（非 IoT）」的 GVLK，本镜像不用，已删。）
+# ⚠ KBN8V 是微软官方 GVLK，同时覆盖 IoT Enterprise LTSC 2024 与 2021（同 SKU 同密钥，
+#   见 learn.microsoft.com「KMS 客户端激活和产品密钥」页）。网上流传的 QPM6N/CGK42 不在
+#   微软官方表里，拿去给 DISM /Set-Edition 用会校验失败、转不了 SKU —— 故保持官方 KBN8V。
 gvlk:
-  IoTEnterpriseS: KBN8V-HFGQ4-MGXVD-347P6-PDQGT   # Windows IoT Enterprise LTSC 2024 / 2021 通用
-  EnterpriseS:    M7XTQ-FN8P6-TTKYV-9D4CC-J462D   # Windows 11 / 10 Enterprise LTSC（备用）
+  # ── 两套密钥别混（微软官方都有，用途不同）──
+  # ① GVLK（KMS 通用批量授权密钥，本项）：用于 DISM /Set-Edition 转版本（上方 07 第 249 行），
+  #    以及 MAS 的 KMS38 激活。KBN8V 是微软官方 GVLK，IoT Enterprise LTSC 2021 与 2024 同 SKU 同密钥
+  #    （见 learn.microsoft.com「KMS 客户端激活和产品密钥」页的 Windows IoT LTSC 标签）。
+  # ② Retail/OEM/MAK 通用零售密钥（QPM6N=2021、CGK42=2024、N979K=订阅版）：微软零售密钥文档 +
+  #    massgrave HWID 表所列，是 MAS「HWID 数字权利」激活时用的密钥，**不是** GVLK。
+  #    DISM /Set-Edition 只认 GVLK（KBN8V），拿零售密钥去转版本会校验失败；但 HWID 激活正是用零售
+  #    密钥。两者各司其职：转版本=KBN8V，HWID 激活=QPM6N/CGK42（由 MAS 脚本内置，不经过本配置）。
+  IoTEnterpriseS: KBN8V-HFGQ4-MGXVD-347P6-PDQGT   # 微软官方 GVLK：IoT Enterprise LTSC 2024 与 2021 通用（转版本用；激活另走 MAS）
 
 # ---- 优化 / 组件：全在本段，写了就生效；注释 / 不写 = 不做 ----
 # 三个子键，各对应一种落地方式（执行器不同）：
@@ -138,7 +145,8 @@ optimize:
 
     # --- 界面（默认用户 hive = 软默认，用户可自己改回）---
     show_file_extensions: "DEFAULT|Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced|HideFileExt|DWORD|0"   # 显示文件扩展名
-    show_hidden_files:    "DEFAULT|Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced|Hidden|DWORD|1"        # 显示隐藏文件
+    show_hidden_files:    "DEFAULT|Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced|Hidden|DWORD|2"         # 默认不显示隐藏文件（手动开「显示隐藏的项目」即生效）
+    show_system_files:    "DEFAULT|Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced|ShowSuperHidden|DWORD|1" # 手动开「显示隐藏」后一并显示系统文件
     taskbar_align_left:   "DEFAULT|Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced|TaskbarAl|DWORD|0"    # Win11 任务栏左对齐
     classic_context_menu: "DEFAULT|Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\\InprocServer32||SZ|"  # Win11 经典右键菜单
     numlock_on:           "DEFAULT|Control Panel\\Keyboard|InitialKeyboardIndicators|SZ|2"                                # 小键盘开机默认亮
@@ -181,7 +189,7 @@ optimize:
   #       在构建期直接写进镜像内部。官方可行落点是「部署后静默安装」：这里写进镜像里的
   #       unattend.xml（synthesize pass），首次开机由 Windows 自己装一遍，跑完自删。
   #       得到的是正常安装：装到官方默认目录（C:\Program Files\…）、可卸载、有「应用和功能」条目。
-  # 装法与参数由安装器类型自动判定，判不出即报错（绝不猜，猜错会弹出图形向导而不报错）：
+  # 装法与参数由安装器类型自动判定；同家族多组候选依次试（前者失败自动试下一组），全失败才报错。
   #   .msi                  → msiexec /i "<文件>" /qn /norestart
   #   .exe (Inno)           → /VERYSILENT /SP- /SUPPRESSMSGBOXES /NORESTART
   #   .exe (NSIS)           → /S

@@ -115,37 +115,42 @@ function Write-Cmd([string] $Path, [string] $Text) {
     [IO.File]::WriteAllText($Path, $t, (New-Object Text.UTF8Encoding($false)))
 }
 
-# ---- 静默安装参数：按「安装器类型」判定，判不出就报错 ----
-#   刻意不写成一个默认值 —— 猜错参数的结果是目标系统上弹出图形安装向导，
-#   而不是失败，这种"看起来成功"的坏结果最难发现。
-function Get-SilentArgs {
+# ---- 静默安装参数：按「安装器类型」判定，同家族多组候选依次试 ----
+#   先匹配具名例外 / 头特征定下「家族」，给出该家族的候选参数列表（首选在前）；
+#   调用方用 || 串联：前者退出码非 0 就自动试下一组，全失败才退出非 0（首启日志可见）。
+#   刻意不跨家族猜（例如绝不在 NSIS 包上试 Inno 的 /VERYSILENT）——
+#   因为装错家族参数会让安装器弹出图形向导卡死首启，比报错更糟。
+function Get-SilentInstallPlan {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string] $Name, [Parameter(Mandatory)] [System.IO.FileInfo] $File)
     $head = [IO.File]::ReadAllBytes($File.FullName)[0..([Math]::Min(1MB, $File.Length - 1))]
     $text = [Text.Encoding]::ASCII.GetString($head)
-    # 已知具名例外：命中即采用其已验证参数，且必须先于下方启发式头检测 ——
+    $n = $File.Name
+    # 已知具名例外：命中即采用其已验证首选参数，且必须先于下方启发式头检测 ——
     # 否则 NSIS/Inno 打包的已知安装器会被头检测抢先、用错静默参数（例如 VC++ 2010 的
     # vcredist_*.exe 是 NSIS 包，头检测会误给 /S 而非官方 /q /norestart，导致首启装失败）。
-    if ($Name -match '^7z') { return '/S' }                                        # 7-Zip（NSIS，精简包可能无 Nullsoft 标记）
-    if ($Name -match 'vc_redist|vc14') { return '/install /quiet /norestart' }     # VC++ 2015-2022
-    if ($Name -match 'vcredist') { return '/q /norestart' }                         # VC++ 2010（vcredist_x86/x64.exe）
-    if ($Name -match 'dotnet|windowsdesktop') { return '/install /quiet /norestart' }  # .NET 运行时
+    # 每条候选都是「完整调用串（含 exe 名）」，调用方直接 || 串联，本函数不再贴 exe 名。
+    if ($Name -match '^7z') { return @('/S', '/S /NCRC') | ForEach-Object { "`"$n`" $_" } }
+    if ($Name -match 'vc_redist|vc14') { return @('/install /quiet /norestart', '/install /norestart', '/quiet /norestart') | ForEach-Object { "`"$n`" $_" } }
+    if ($Name -match 'vcredist') { return @('/q /norestart', '/q', '/silent /norestart') | ForEach-Object { "`"$n`" $_" } }
+    if ($Name -match 'dotnet|windowsdesktop') { return @('/install /quiet /norestart', '/install') | ForEach-Object { "`"$n`" $_" } }
     if ($Name -match 'directx|dxruntime') {
         # Jun2010 自解包：先 /Q /C /T: 解出 DXSETUP.exe 到子目录，再静默装（/silent 不弹 EULA）
         $dx = '%SystemDrive%\Tools\install\dx'
-        return "/Q /C /T:`"$dx`" && `"$dx\DXSETUP.exe`" /silent /norestart"
+        return @("`"$n`" /Q /C /T:`"$dx`" && `"$dx\DXSETUP.exe`" /silent /norestart")
     }
-    # 启发式头检测：仅对上面没认出的 .exe 生效
     if ($text -match 'Inno Setup') {
         # Inno Setup 官方命令行文档：/VERYSILENT 无 UI，/SP- 去掉启动提示，
         # /SUPPRESSMSGBOXES 抑制对话框，/NORESTART 不重启
-        return '/VERYSILENT /SP- /SUPPRESSMSGBOXES /NORESTART'
+        return @('/VERYSILENT /SP- /SUPPRESSMSGBOXES /NORESTART', '/SILENT /SP- /NORESTART', '/VERYSILENT /NORESTART') | ForEach-Object { "`"$n`" $_" }
     }
     if ($text -match 'Nullsoft') {
         # NSIS：/S 静默（**必须大写**）
-        return '/S'
+        return @('/S', '/S /NCRC') | ForEach-Object { "`"$n`" $_" }
     }
-    throw "components.$Name 是 .exe 但认不出安装器类型（Inno/NSIS/已知具名），无法确定静默参数 —— 请显式补一条规则，别用猜的"
+    # 实在认不出家族：给一组「最坏也是静默失败、绝不弹 GUI 卡死首启」的兜底候选（/S 对 Inno/NSIS 都有效）。
+    # 仍建议为它补一条具名规则（见上方），比依赖兜底更稳。
+    return @('/S', '/VERYSILENT /SP- /SUPPRESSMSGBOXES /NORESTART', '/S /NCRC') | ForEach-Object { "`"$n`" $_" }
 }
 
 # ---- 把组件静默安装写进应答文件（synthesize pass）----
@@ -248,6 +253,19 @@ try {
         if ($now -ne $edition) { throw "Set-Edition 后复检不符：期望 $edition 实际 $now" }
         Log "Set-Edition 完成，当前 SKU = $now"
     }
+
+    # ---------- 1b) 转完版本后把安装密钥换成零售密钥：让重装自动领 HWID 数字权利 ----------
+    #   上面的 Set-Edition 用 GVLK(KBN8V) 只负责"转 SKU"，GVLK 本身不激活；源 ISO 又是 VL 媒体，
+    #   若装的是 GVLK，重装时不会自动激活（massgrave 明确：VL 媒体需手动插零售密钥）。
+    #   故转完版本（无论是否跳过）后，用本分支零售密钥（MAS HWID 用的同一把）覆盖安装密钥 ——
+    #   重装同版本时 Windows 凭 HWID+版本 在服务端已有数字权利，自动激活，无需再跑 MAS。
+    $retailKey = [string]$cfg.branches.$BranchId.retail_key
+    if (-not $retailKey) {
+        throw "config.json 缺 branches.$BranchId.retail_key（转版本后必须换零售密钥）"
+    }
+    Log "Set-ProductKey（换零售密钥，供重装自动激活）: $retailKey"
+    dism.exe /English /Image:$mount /Set-ProductKey:$retailKey
+    if ($LASTEXITCODE -ne 0) { throw "Set-ProductKey 失败（DISM 退出码 $LASTEXITCODE）" }
 
     # ---------- 2) 离线优化注入（optimize.registry：config 写了就写）----------
     #   数据全部来自 config.json（由 config-to-json.py 从 config.yml 拍平），代码里不硬编码名单
@@ -406,10 +424,11 @@ pause
                     Log "组件 $k -> $($f.Name)（静默安装，msiexec）"
                 }
                 '.exe' {
-                    # 静默开关按安装器类型区分 —— 认不出就报错，绝不猜参数
-                    $sw = Get-SilentArgs -Name $k -File $f
-                    $cmds += ('"{0}" {1}' -f $f.Name, $sw)
-                    Log "组件 $k -> $($f.Name)（静默安装：$sw）"
+                    # 候选参数用 || 串联：前者失败自动试下一组，全失败才退出非 0（首启日志可见）
+                    $plan = Get-SilentInstallPlan -Name $k -File $f
+                    $arg = if ($plan.Count -eq 1) { $plan[0] } else { '(' + ($plan -join ' || ') + ')' }
+                    $cmds += $arg
+                    Log "组件 $k -> $($f.Name)（静默安装候选 $($plan.Count) 组，|| 依次尝试）"
                 }
                 default { throw "components.$k 的载荷 $($f.Name) 不是安装包（只支持 .exe / .msi；便携包请自行放 assets\redist 并改用解包逻辑）" }
             }

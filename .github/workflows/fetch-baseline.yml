@@ -35,14 +35,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          CHUNK_MIB: "1900"      # 每片上限(MiB)，留余量避开 GitHub 2GB 资产上限
+          THREADS: "16"          # 下载并发连接数（aria2 -x/-s）。嫌慢改 32
         run: |
           set -euo pipefail
           trap 'echo "---- 失败: $BASH_COMMAND ----"' ERR
 
-          CHUNK_MIB="$(awk '/^baseline:/{f=1} f && /chunk_mib:/{print $2; exit}' config.yml)"
-          : "${CHUNK_MIB:=1900}"
-          THREADS="$(awk '/^baseline:/{f=1} f && /threads:/{print $2; exit}' config.yml)"
-          : "${THREADS:=16}"
+          # 分片大小 / 并发数直接取自上方 env:（config.yml 已不保留这两项）
+          CHUNK_MIB="${CHUNK_MIB:-1900}"
+          THREADS="${THREADS:-16}"
           echo "分片大小 = ${CHUNK_MIB} MiB | 并发连接 = ${THREADS}"
 
           # 解析 config.yml 的 baseline.sources -> TSV：branch<TAB>url<TAB>sha256

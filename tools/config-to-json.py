@@ -221,12 +221,7 @@ def main():
     bl = cfg.get("baseline") or {}
     if not isinstance(bl, dict):
         fail("baseline 必须是映射")
-    chunk = int(bl.get("chunk_mib") or 0)
-    if chunk <= 0:
-        fail("baseline.chunk_mib 必须是正整数（MiB）")
-    threads = int(bl.get("threads") or 0)
-    if threads <= 0:
-        fail("baseline.threads 必须是正整数")
+    # chunk_mib / threads 已移到 fetch-baseline.yml 的 env（只影响下载切分，不进镜像，故不在此解析）
     sources = bl.get("sources")
     if not isinstance(sources, list) or not sources:
         fail("baseline.sources 必须是非空列表（一行一条镜像，份数 = 条数）")
@@ -270,6 +265,11 @@ def main():
             fail(f"{where}.edition 必填（构建时 Set-Edition 的目标 SKU）")
         if ed not in gvlk:
             fail(f"{where}.edition={ed} 不在 gvlk 表里（没密钥转不了 SKU）")
+        rk = str(bv.get("retail_key") or "").strip()
+        if not rk:
+            fail(f"{where}.retail_key 必填（IoT Enterprise LTSC <年> 零售密钥；转版本后换上它，重装才能自动领 HWID 数字权利）")
+        if not re.match(r"^[A-Z0-9]{5}(-[A-Z0-9]{5}){4}$", rk):
+            fail(f"{where}.retail_key 不像零售密钥: {rk!r}")
         if not str(bv.get("detect") or "").strip():
             # check-updates 用它在 Update Catalog 里认本分支的产品：
             # 只有搜到该产品的累积更新，才能比较"微软发了新的没"
@@ -323,12 +323,13 @@ def main():
 
     # ---- 归一化后落盘（pwsh 侧不用再处理 null） ----
     out = {
-        "baseline": {"chunk_mib": chunk, "threads": threads, "sources": sources},
+        "baseline": {"sources": sources},
         "remove": glob_rm,
         "branches": {
             b: {
                 "label": str(bv.get("label")).strip(),
                 "edition": str(bv.get("edition")).strip(),
+                "retail_key": str(bv.get("retail_key") or "").strip(),
                 "detect": str(bv.get("detect")).strip(),
                 "family": [int(x) for x in norm_list(bv.get("family"), f"branches.{b}.family", keep_int=True)],
                 "remove": norm_list(bv.get("remove"), f"branches.{b}.remove"),

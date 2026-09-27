@@ -12,47 +12,10 @@
 
 on:
   workflow_dispatch:
-    inputs:
-      upload_release:
-        description: "上传到仓库 Release"
-        type: boolean
-        default: true
-      upload_r2:
-        description: "上传到 Cloudflare R2"
-        type: boolean
-        default: false
-      upload_onedrive:
-        description: "上传到 SharePoint（默认站点默认文档库）"
-        type: boolean
-        default: false
-      keep_release:
-        description: "Release 保留版本数"
-        type: number
-        default: 3
-      keep_r2:
-        description: "R2 保留版本数"
-        type: number
-        default: 1
-      keep_onedrive:
-        description: "SharePoint 保留版本数"
-        type: number
-        default: 2
-      onedrive_path:
-        description: "SharePoint 文档库内根文件夹（可含子路径，如 ISO/WinLTSC；留空=文档库根）"
-        type: string
-        default: WinLTSC
-      release_chunk:
-        description: "Release 分片大小（GB，按此切；填多少切多少；务必 < 2GB 单文件硬上限）"
-        type: string
-        default: "1.9"
-      r2_chunk:
-        description: "R2(S3类) 分片大小（GB；每片单 PUT，务必 < 5GB 单 PUT 硬上限；填多少切多少）"
-        type: string
-        default: "4.9"
-      onedrive_chunk:
-        description: "OneDrive/SharePoint 分片大小（GB；≥ ISO 则不切、单文件上传；填多少切多少）"
-        type: string
-        default: "99"
+    # 手动触发：无表单输入。
+    # 原「上传开关 / 保留份数 / 分片大小」表单已移除——表单值不持久、每次运行都得手动重填，毫无意义。
+    # 现改为「凭据驱动开关」：填了哪个通道的 Secret 就自动开哪个（见 build job 的 env: 块）；
+    # 仅 SharePoint 站点根目录改用仓库 Variable（Settings → Variables → ONEDRIVE_PATH），可持久修改、无需动代码。
   repository_dispatch:
     types: [build-by-update]
   schedule:
@@ -119,16 +82,22 @@ jobs:
       EDITION: ${{ matrix.edition }}
       SRC_ISO: ${{ matrix.iso }}
       SRC_SHA256: ${{ matrix.sha256 }}
-      DO_RELEASE: ${{ (github.event_name == 'workflow_dispatch' && inputs.upload_release) || (github.event_name == 'repository_dispatch' && github.event.client_payload.upload_release) || true }}
-      DO_R2: ${{ (github.event_name == 'workflow_dispatch' && inputs.upload_r2) || (github.event_name == 'repository_dispatch' && github.event.client_payload.upload_r2) || false }}
-      DO_ONEDRIVE: ${{ (github.event_name == 'workflow_dispatch' && inputs.upload_onedrive) || (github.event_name == 'repository_dispatch' && github.event.client_payload.upload_onedrive) || false }}
-      KEEP_RELEASE: ${{ (github.event_name == 'workflow_dispatch' && inputs.keep_release) || (github.event_name == 'repository_dispatch' && github.event.client_payload.keep_release) || 3 }}
-      KEEP_R2: ${{ (github.event_name == 'workflow_dispatch' && inputs.keep_r2) || (github.event_name == 'repository_dispatch' && github.event.client_payload.keep_r2) || 1 }}
-      KEEP_ONEDRIVE: ${{ (github.event_name == 'workflow_dispatch' && inputs.keep_onedrive) || (github.event_name == 'repository_dispatch' && github.event.client_payload.keep_onedrive) || 2 }}
-      OD_PATH: ${{ (github.event_name == 'workflow_dispatch' && inputs.onedrive_path) || (github.event_name == 'repository_dispatch' && github.event.client_payload.onedrive_path) || 'WinLTSC' }}
-      RELEASE_CHUNK: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_chunk) || (github.event_name == 'repository_dispatch' && github.event.client_payload.release_chunk) || '1.9' }}
-      R2_CHUNK: ${{ (github.event_name == 'workflow_dispatch' && inputs.r2_chunk) || (github.event_name == 'repository_dispatch' && github.event.client_payload.r2_chunk) || '4.9' }}
-      OD_CHUNK: ${{ (github.event_name == 'workflow_dispatch' && inputs.onedrive_chunk) || (github.event_name == 'repository_dispatch' && github.event.client_payload.onedrive_chunk) || '99' }}
+      # ── 上传通道开关：凭据驱动——哪个通道的 Secret 填了就自动开，没填就自动关，无需手动改代码。
+      #    （凭据缺失时硬传只会拿不到 token 报错，故用「Secret 非空」作为开关最稳。）
+      DO_RELEASE: "true"                                   # 仓库 Release 永远开（内置 token 即可）
+      DO_R2: ${{ secrets.R2_ACCESS_KEY_ID != '' }}         # 填了 R2_ACCESS_KEY_ID 才传 R2
+      DO_ONEDRIVE: ${{ secrets.ONEDRIVE_TENANT_ID != '' }} # 填了 ONEDRIVE_TENANT_ID 才传 OneDrive
+      # ── 各通道 prune 保留版本数 ──
+      KEEP_RELEASE: 3
+      KEEP_R2: 1
+      KEEP_ONEDRIVE: 2
+      # ── 分片大小（GB）：务必 < 各通道单文件硬上限 ──
+      RELEASE_CHUNK: "1.9"    # GitHub Release 单文件硬上限 2GiB → 必须 < 2
+      R2_CHUNK: "4.9"         # R2/S3 单 PUT 硬上限 5GiB → 必须 < 5
+      OD_CHUNK: "99"          # OneDrive/SharePoint：≥ ISO 即单文件上传（不切分）
+      # ── SharePoint 站点内根文件夹：用仓库 Variable 配置（Settings → Variables → ONEDRIVE_PATH），
+      #    可持久修改、无需改代码；未设置时回退到 WinLTSC。
+      OD_PATH: ${{ vars.ONEDRIVE_PATH || 'WinLTSC' }}
 
     steps:
       - name: Checkout 本仓库（delta + 配置 + tools）
