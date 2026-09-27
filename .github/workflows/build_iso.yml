@@ -19,7 +19,9 @@ on:
   repository_dispatch:
     types: [build-by-update]
   schedule:
-    # 每月「Patch Tuesday（第2周二）后一天」= 每月第2/3周三 02:00 UTC 兜底（运行前查当天是否已构建，当天已构建则跳过）
+    # 每月「Patch Tuesday（第2周二）后一天」= 每月第2/3周三 02:00 UTC 兜底。
+    # 同日去重见下方「去重」step：对 schedule 与 repository_dispatch(build-by-update) 生效，
+    # 当天该 edition 已有 Release(tag=yyMMdd-UBR-edition) 即 SKIP，避免一日多次构建；手动 workflow_dispatch 不拦。
     - cron: "0 2 9-15 * 3"
 
 permissions:
@@ -150,8 +152,8 @@ jobs:
           export PYTHONUNBUFFERED=1   # 让 python 的 log 即时刷到 Actions 日志，不被缓冲到结束才显示
           python self/tools/fetch-payloads.py --config self/config.json --dest src --branch "${{ matrix.branch }}"
 
-      - name: cron 去重（当天兜底，当天已构建则跳过）
-        if: github.event_name == 'schedule'
+      - name: 去重（当天已构建则跳过，作用于所有自动触发）
+        if: github.event_name != 'workflow_dispatch'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
