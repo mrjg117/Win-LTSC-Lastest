@@ -401,10 +401,8 @@ jobs:
             Write-Host "已删除中间目录 src/ISO，释放 $gb GB"
           }
           if ($env:DO_RELEASE -eq 'true') {
-            $logs = @(Get-ChildItem src/logs -Filter *.log -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
-            Write-Host "Release 附件清单（$($logs.Count) 个日志 + manifest.json）："
-            foreach ($l in $logs) { Write-Host ("  {0}  {1:N0} B" -f (Split-Path $l -Leaf), (Get-Item $l).Length) }
-            Write-Host ("  manifest.json  {0:N0} B" -f (Get-Item src/manifest.json).Length)
+            # 完全成功：Release 仅含后续步上传的 ISO 分片 + merge.cmd，不挂日志/manifest。
+            # 构建/打包日志只在失败(cancelled)时由「保留 Patch 日志」step 作为 CI artifact 保留（retention 3 天）。
             # 幂等：同月同 UBR 重跑会撞同名 tag（上次的失败运行也留下过空壳 Release），先删再建
             gh release view "$tag" --repo $repo 2>$null
             if ($LASTEXITCODE -eq 0) {
@@ -414,7 +412,7 @@ jobs:
             } else {
               Write-Host "无同名 Release，直接创建 $tag"
             }
-            gh release create "$tag" --repo $repo --title "$tag" --notes "branch=${{ matrix.branch }} | upstream_commit=$env:UPSTREAM_COMMIT | UBR=$ubr | 源镜像=$env:SRC_ISO" @logs src/manifest.json
+            gh release create "$tag" --repo $repo --title "$tag" --notes "branch=${{ matrix.branch }} | upstream_commit=$env:UPSTREAM_COMMIT | UBR=$ubr | 源镜像=$env:SRC_ISO"
             if ($LASTEXITCODE -ne 0) { throw "Release 创建失败: $tag" }
             Write-Host "Release $tag 已创建: $(gh release view "$tag" --repo $repo --json url --jq .url)"
           }
