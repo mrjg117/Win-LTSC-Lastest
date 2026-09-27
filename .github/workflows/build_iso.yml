@@ -15,7 +15,7 @@ on:
     # 手动触发：无表单输入。
     # 原「上传开关 / 保留份数 / 分片大小」表单已移除——表单值不持久、每次运行都得手动重填，毫无意义。
     # 现改为「凭据驱动开关」：填了哪个通道的 Secret 就自动开哪个（见 build job 的 env: 块）；
-    # 仅 SharePoint 站点根目录改用仓库 Variable（Settings → Variables → ONEDRIVE_PATH），可持久修改、无需动代码。
+    # SharePoint 站点根目录也走 Secret（Settings → Secrets → ONEDRIVE_PATH，日志打码），未设回退 WinLTSC。
   repository_dispatch:
     types: [build-by-update]
   schedule:
@@ -95,9 +95,9 @@ jobs:
       RELEASE_CHUNK: "1.9"    # GitHub Release 单文件硬上限 2GiB → 必须 < 2
       R2_CHUNK: "4.9"         # R2/S3 单 PUT 硬上限 5GiB → 必须 < 5
       OD_CHUNK: "99"          # OneDrive/SharePoint：≥ ISO 即单文件上传（不切分）
-      # ── SharePoint 站点内根文件夹：用仓库 Variable 配置（Settings → Variables → ONEDRIVE_PATH），
-      #    可持久修改、无需改代码；未设置时回退到 WinLTSC。
-      OD_PATH: ${{ vars.ONEDRIVE_PATH || 'WinLTSC' }}
+      # ── SharePoint 站点内根文件夹：用仓库 Secret 配置（Settings → Secrets → ONEDRIVE_PATH），
+      #    放 Secret 可在日志中打码（路径不裸露）；未设置时回退到 WinLTSC。
+      OD_PATH: ${{ secrets.ONEDRIVE_PATH || 'WinLTSC' }}
 
     steps:
       - name: Checkout 本仓库（delta + 配置 + tools）
