@@ -19,8 +19,8 @@ on:
   repository_dispatch:
     types: [build-by-update]
   schedule:
-    # 每月第3周三 02:00 UTC 兜底（运行前查本月是否已构建，已构建则跳过，避免与事件驱动重复）
-    - cron: "0 2 15-21 * 3"
+    # 每月「Patch Tuesday（第2周二）后一天」= 每月第2/3周三 02:00 UTC 兜底（运行前查当天是否已构建，当天已构建则跳过）
+    - cron: "0 2 9-15 * 3"
 
 permissions:
   contents: write
@@ -150,21 +150,21 @@ jobs:
           export PYTHONUNBUFFERED=1   # 让 python 的 log 即时刷到 Actions 日志，不被缓冲到结束才显示
           python self/tools/fetch-payloads.py --config self/config.json --dest src --branch "${{ matrix.branch }}"
 
-      - name: cron 去重（仅每月兜底，本月已构建则跳过）
+      - name: cron 去重（当天兜底，当天已构建则跳过）
         if: github.event_name == 'schedule'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $edition = $env:EDITION
-          $ym = Get-Date -Format yyMM
+          $ymd = Get-Date -Format yyMMdd
           $raw = @(gh release list --repo "${{ github.repository }}" --limit 200 --json tagName --jq '.[].tagName')
           foreach ($t in $raw) {
-            if ($t -match "^(\d{2})(\d{2})\d{2}-\d+-$edition$") {
-              $p = "$($matches[1])$($matches[2])"
-              if ($p -eq $ym) {
+            if ($t -match "^(\d{2})(\d{2})(\d{2})-\d+-$edition$") {
+              $p = "$($matches[1])$($matches[2])$($matches[3])"
+              if ($p -eq $ymd) {
                 echo "SKIP=1" >> "$env:GITHUB_ENV"
-                echo "本月已有 $t 构建，跳过"
+                echo "今日已有 $t 构建，跳过"
                 break
               }
             }
@@ -594,7 +594,7 @@ jobs:
             # OD_CHUNK >= ISO → 不切，单文件走 upload session（OneDrive 原生支持到 250GB）
             # 单文件也附 merge.cmd：下载端可独立校验 SHA256（不再"无哈希保护"）
             Write-Host ("OneDrive：OD_CHUNK={0} GB >= ISO {1:N2} GB，单文件上传（不切分，仍附 merge.cmd 供哈希校验）" -f $env:OD_CHUNK, ($size / 1GB))
-            Send-SharePointUpload -Iso $finalIso -Tag $env:TAG `
+            Send-SharePointUpload -Iso $finalIso `
               -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
               -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
               -Path $env:OD_PATH
@@ -602,7 +602,7 @@ jobs:
             $expLine = 'set "EXP_' + $isoBase + '.iso=' + $env:ISO_SHA256 + '"'
             $tpl = $tpl -replace '(?s)(REM ===EXPECTED_HASHES_START===).*?(REM ===EXPECTED_HASHES_END===)', ('$1' + [Environment]::NewLine + $expLine + [Environment]::NewLine + '$2')
             Set-Content -Path "out/merge.cmd" -Value $tpl -NoNewline
-            Send-SharePointUpload -Iso "out/merge.cmd" -Tag $env:TAG `
+            Send-SharePointUpload -Iso "out/merge.cmd" `
               -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
               -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
               -Path $env:OD_PATH
@@ -630,7 +630,7 @@ jobs:
                   }
                 } finally { $out.Close() }
                 Write-Host ("OneDrive 上传 {0}（{1:N1} MB）" -f $name, ($written / 1MB))
-                Send-SharePointUpload -Iso $name -Tag $env:TAG `
+                Send-SharePointUpload -Iso $name `
                   -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
                   -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
                   -Path $env:OD_PATH
@@ -645,7 +645,7 @@ jobs:
             $expLine = 'set "EXP_' + $isoBase + '.iso=' + $env:ISO_SHA256 + '"'
             $tpl = $tpl -replace '(?s)(REM ===EXPECTED_HASHES_START===).*?(REM ===EXPECTED_HASHES_END===)', ('$1' + [Environment]::NewLine + $expLine + [Environment]::NewLine + '$2')
             Set-Content -Path "out/merge.cmd" -Value $tpl -NoNewline
-            Send-SharePointUpload -Iso "out/merge.cmd" -Tag $env:TAG `
+            Send-SharePointUpload -Iso "out/merge.cmd" `
               -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
               -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
               -Path $env:OD_PATH

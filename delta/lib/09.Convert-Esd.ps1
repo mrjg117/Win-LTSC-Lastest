@@ -41,11 +41,23 @@ foreach ($c in @((Join-Path $WorkDir 'wimlib-imagex.exe'),
     if (Test-Path $c) { $wimlib = $c; break }
 }
 
+# 压缩前尽量释放内存：清理任何残留的 WIM 挂载（Dism 会把挂载镜像占用的内存交还系统），
+# 让 wimlib 按"可用内存"选线程时能上更多核（前面讨论过它常被掐到 2 线程就是内存不够）。
+try {
+    Log "压缩前清理残留 WIM 挂载（Dism /Cleanup-Wim）"
+    dism.exe /English /Cleanup-Wim >$null 2>&1
+} catch {}
+
 $sw = [Diagnostics.Stopwatch]::StartNew()
+# LZMS solid 的 chunk 越大压缩率越好；64 MiB 是 wimlib 对 LZMS 的**上限**（即默认值），
+# 故用最大值以保住压缩率——绝不为了上核而缩小 chunk（缩小会损失压缩率）。
+# 线程数交给 wimlib 按【可用内存】自定：前面已 dism /Cleanup-Wim 把挂载镜像占用的内存交还，
+# 4 vCPU / 16GB 的 Runner 上通常能直接上满 4 核；不强制 --threads，避免内存不足时 OOM。
+$LZMS_CHUNK = 64MB
 if ($wimlib) {
     Log "wimlib: $wimlib"
-    Log "wimlib-imagex export install.wim all install.esd --compress=LZMS --solid"
-    & $wimlib export $src all $dst --compress=LZMS --solid
+    Log ("wimlib-imagex export install.wim all install.esd --compress=LZMS --solid --chunk-size {0}" -f $LZMS_CHUNK)
+    & $wimlib export $src all $dst --compress=LZMS --solid --chunk-size $LZMS_CHUNK
     $rc = $LASTEXITCODE
 } else {
     Log "WARN 未找到 wimlib-imagex.exe -> 回退 DISM /Export-Image /Compress:Recovery（慢很多）"

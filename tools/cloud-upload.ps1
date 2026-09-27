@@ -9,7 +9,8 @@
 #   . self/tools/cloud-upload.ps1
 #   Send-R2Upload   -Iso <path> -Tag <tag> -AccountId <x> -Bucket <b> -Region <r> -AccessKey <ak> -SecretKey <sk>
 #   Invoke-R2Prune  -Tag <tag> -AccountId <x> -Bucket <b> -Region <r> -AccessKey <ak> -SecretKey <sk> -Keep <n> -Edition <e>
-#   Send-SharePointUpload -Iso <path> -Tag <tag> -TenantId <t> -ClientId <c> -CertKeyPem <path> [-CertThumbprint <hex>] [-CertPem <path>] -SiteHost <host> [-Path <rootFolder>]
+#   Send-SharePointUpload -Iso <path> -TenantId <t> -ClientId <c> -CertKeyPem <path> [-CertThumbprint <hex>] [-CertPem <path>] -SiteHost <host> [-Path <rootFolder>]
+#       （文件平铺到 -Path 目录下，不再按 tag 建子目录；文件名本身含日期+UBR 足以区分构建）
 #   Invoke-SharePointPrune -TenantId <t> -ClientId <c> -CertKeyPem <path> [-CertThumbprint <hex>] [-CertPem <path>] -SiteHost <host> -Keep <n> -Edition <e>
 #   鉴权标识：CertThumbprint（hex 指纹）与 CertPem（X.509 公钥证书 PEM）任选其一——给了证书会自动算指纹并附 x5c。私钥(CertKeyPem)始终必填。
 #
@@ -142,9 +143,12 @@ function Resolve-SiteDrive {
 }
 
 # ---------- SharePoint：可续传 upload session 上传大文件 ----------
+# 目标路径 = OD_PATH（仓库 Secret ONEDRIVE_PATH，未设回退 WinLTSC）/<文件名>
+# 平铺存放，不再额外拼 <tag> 子目录：文件名本身已含日期+UBR（如 <stem>_260927_19041），足以区分构建；
+# 且 OneDrive/SharePoint 的 createUploadSession 不会自动建父目录，多拼一层不存在的子目录会 400 invalidRequest。
 function Send-SharePointUpload {
     param(
-        [string]$Iso, [string]$Tag, [string]$TenantId, [string]$ClientId,
+        [string]$Iso, [string]$TenantId, [string]$ClientId,
         [string]$CertKeyPem, [string]$CertThumbprint, [string]$CertPem, [string]$SiteHost,
         [string]$Path = 'WinLTSC'
     )
@@ -153,10 +157,10 @@ function Send-SharePointUpload {
     $driveRoot = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive/root"
     $h = @{ Authorization = "Bearer $token" }
     $fileName = Split-Path $Iso -Leaf
-    # 路径段编码（<Path>/<tag>/<file>），用冒号可寻址语法拿 upload session
+    # 路径段编码（<Path>/<file>）：直接用 OD_PATH 作目标目录，文件落在其下
     # Path 可含子路径（如 ISO/WinLTSC），按 / 拆段各自编码（slash 是 Graph 寻址分隔符，不能整体转义）
     $prefixSegs = @($Path -split '/' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { [System.Uri]::EscapeDataString($_) })
-    $seg = ($prefixSegs + [System.Uri]::EscapeDataString($Tag) + [System.Uri]::EscapeDataString($fileName)) -join '/'
+    $seg = ($prefixSegs + [System.Uri]::EscapeDataString($fileName)) -join '/'
     $createUrl = "$driveRoot/:$seg`:/createUploadSession"
     $sess = Invoke-RestMethod -Uri $createUrl -Method Post -Headers $h -Body '{}' -ContentType 'application/json'
 
@@ -184,10 +188,12 @@ function Send-SharePointUpload {
             Write-Host ("SharePoint 上传进度: {0:0.0}%" -f (100.0 * $start / $total))
         }
     } finally { $fs.Close() }
-    Write-Host "SharePoint 上传完成: $Path/$Tag/$fileName"
+    Write-Host "SharePoint 上传完成: $Path/$fileName"
 }
 
 # ---------- SharePoint：列举 + 删除（prune，保留 KEEP 个）----------
+# 上传已改为平铺到 OD_PATH 下（不再按 tag 建子目录），故此处按「文件名」清理旧 ISO：
+# 只删 .iso 大文件（不碰 merge.cmd / 其它文件），文件名形如 <stem>_<date>_<ubr>，按名降序即按日期降序，Skip KEEP 删最旧
 function Invoke-SharePointPrune {
     param(
         [string]$TenantId, [string]$ClientId, [string]$CertKeyPem, [string]$CertThumbprint, [string]$CertPem,
@@ -200,12 +206,12 @@ function Invoke-SharePointPrune {
     $pathSegs = @($Path -split '/' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { [System.Uri]::EscapeDataString($_) })
     $root = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive/root:/$(($pathSegs -join '/')):/children"
     $r = Invoke-RestMethod -Uri $root -Headers $h -Method Get
-    # 目录名形如 <date>-<ubr>-<edition>；按名降序，Skip Keep 删最旧
-    $folders = @($r.value | Where-Object { $_.folder -and $_.name -like "*-$Edition" } | Sort-Object name -Descending)
-    $old = @($folders | Select-Object -Skip $Keep)
+    # 仅 .iso 且文件名含 $Edition；按名降序即按日期降序
+    $files = @($r.value | Where-Object { $_.file -and $_.name -like '*.iso' -and $_.name -like "*-$Edition*" } | Sort-Object name -Descending)
+    $old = @($files | Select-Object -Skip $Keep)
     foreach ($d in $old) {
         Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive/items/$($d.id)" -Headers $h -Method Delete
         Write-Host "SharePoint prune: 删除 $($d.name)"
     }
-    if ($old.Count -eq 0) { Write-Host "SharePoint prune: 无超期目录" }
+    if ($old.Count -eq 0) { Write-Host "SharePoint prune: 无超期 ISO（保留 $Keep 个）" }
 }
