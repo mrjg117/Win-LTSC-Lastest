@@ -9,8 +9,8 @@
 #   . self/tools/cloud-upload.ps1
 #   Send-R2Upload   -Iso <path> -Tag <tag> -AccountId <x> -Bucket <b> -Region <r> -AccessKey <ak> -SecretKey <sk>
 #   Invoke-R2Prune  -Tag <tag> -AccountId <x> -Bucket <b> -Region <r> -AccessKey <ak> -SecretKey <sk> -Keep <n> -Edition <e>
-#   Send-SharePointUpload -Iso <path> -TenantId <t> -ClientId <c> -CertKeyPem <path> [-CertThumbprint <hex>] [-CertPem <path>] -SiteHost <host> [-Path <rootFolder>]
-#       （文件平铺到 -Path 目录下，不再按 tag 建子目录；文件名本身含日期+UBR 足以区分构建）
+#   Send-SharePointUpload -Iso <path> -TenantId <t> -ClientId <c> -CertKeyPem <path> [-CertThumbprint <hex>] [-CertPem <path>] -SiteHost <host> [-Path <subfolder>]
+#       （目标 = 默认站点/默认文档库；Path 为空 -> 文档库根，非空 -> Path 子目录；绝不拼 tag 子目录）
 #   Invoke-SharePointPrune -TenantId <t> -ClientId <c> -CertKeyPem <path> [-CertThumbprint <hex>] [-CertPem <path>] -SiteHost <host> -Keep <n> -Edition <e>
 #   鉴权标识：CertThumbprint（hex 指纹）与 CertPem（X.509 公钥证书 PEM）任选其一——给了证书会自动算指纹并附 x5c。私钥(CertKeyPem)始终必填。
 #
@@ -137,28 +137,40 @@ function Get-GraphToken {
 function Resolve-SiteDrive {
     param([string]$Token, [string]$SiteHost)
     $h = @{ Authorization = "Bearer $Token" }
-    # 默认站点：GET /sites/{host} 拿到根站点，其 .drive 即默认文档库
-    $site = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($SiteHost))" -Headers $h -Method Get
+    # 默认站点/默认文档库：
+    #  - SiteHost 非空 -> GET /sites/{host} 取该主机根站点（如 contoso.sharepoint.com）；
+    #  - SiteHost 为空 -> GET /sites/root 取租户根站点（真正的「默认站点」）。
+    # 站点 .drive = 该站点的默认文档库（即 /sites/{id}/drive/root）。
+    $siteUri = if ($SiteHost) {
+        "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($SiteHost))"
+    } else {
+        "https://graph.microsoft.com/v1.0/sites/root"
+    }
+    $site = Invoke-RestMethod -Uri $siteUri -Headers $h -Method Get
     return $site.id   # 站点 id，用于 /sites/{id}/drive
 }
 
 # ---------- SharePoint：确保目标目录存在（幂等）----------
-# createUploadSession 按路径寻址时【不会自动建父目录】，父目录缺失直接 400 invalidRequest
-# （本仓 run 36292555261、36305285789 两次真实失败均为此根因：OD_PATH 未确认存在于目标 drive）。
-# 仅针对用户给定的 OD_PATH（仓库 Secret ONEDRIVE_PATH），逐段 GET 探测、缺失则建；已存在直接跳过。
-# 绝不发明任何额外子目录（如 <tag>）。
+# Graph 按路径寻址的正确语法是 drive/root:/<path>:（冒号紧贴 root，NOT drive/root/:/...）。
+# 父目录缺失时 createUploadSession 会直接 400 invalidRequest；因此上传/列举前先逐段确认目录存在。
+# 仅针对用户给定的 OD_PATH（Secret ONEDRIVE_PATH）：逐段 GET 探测、缺失则建；已存在跳过。
+# 绝不发明额外子目录（如 <tag>）。RelativePath 为空 = 落在默认文档库根，无需建目录。
 function Ensure-SharePointFolder {
     param([string]$DriveRoot, [string]$Token, [string]$RelativePath)
+    # $DriveRoot = https://graph.microsoft.com/v1.0/sites/{id}/drive （默认文档库 base）
     $h = @{ Authorization = "Bearer $Token" }
     $segs = @($RelativePath -split '/' | Where-Object { $_.Trim() -ne '' })
     $acc = ''
     foreach ($seg in $segs) {
         $enc = [System.Uri]::EscapeDataString($seg)
-        $addr = if ($acc -eq '') { "$DriveRoot/:$enc`:" } else { "$DriveRoot/:$acc/$enc`:" }
+        $accNow = if ($acc -eq '') { $enc } else { "$acc/$enc" }
+        # 按路径寻址探测：drive/root:/<accNow>:
+        $addr = "$DriveRoot/root:/$accNow`:"
         $exists = $false
         try { Invoke-RestMethod -Uri $addr -Headers $h -Method Get -ErrorAction Stop | Out-Null; $exists = $true } catch { $exists = $false }
         if (-not $exists) {
-            $parentChildren = if ($acc -eq '') { "$DriveRoot/children" } else { "$DriveRoot/:$acc`:/children" }
+            # 父目录的 children 端点：根 -> drive/root/children；子目录 -> drive/root:/<parent>:/children
+            $parentChildren = if ($acc -eq '') { "$DriveRoot/root/children" } else { "$DriveRoot/root:/$acc`:/children" }
             $body = (@{ name = $seg; folder = @{} } | ConvertTo-Json -Compress)
             try {
                 Invoke-RestMethod -Uri $parentChildren -Headers $h -Method Post -Body $body -ContentType 'application/json' -ErrorAction Stop | Out-Null
@@ -170,32 +182,37 @@ function Ensure-SharePointFolder {
                 if (-not $recheck) { throw $_ }
             }
         }
-        $acc = if ($acc -eq '') { $seg } else { "$acc/$seg" }
+        $acc = $accNow
     }
 }
 
 # ---------- SharePoint：可续传 upload session 上传大文件 ----------
-# 目标路径 = OD_PATH（仓库 Secret ONEDRIVE_PATH）/<文件名>，平铺存放，不拼 <tag> 子目录。
-# 文件名本身已含日期+UBR，足以区分构建。上传前先 Ensure-SharePointFolder 确认 OD_PATH 存在。
+# 目标 = 默认站点/默认文档库（/sites/{id}/drive/root）下：
+#   - Path 为空 -> 直接传到文档库根：drive/root:/<文件名>:
+#   - Path 非空 -> 传到 Path 子目录：drive/root:/<Path>/<文件名>:
+# 文件名本身含日期+UBR，足以区分构建；绝不再拼 <tag> 之类子目录。
 function Send-SharePointUpload {
     param(
         [string]$Iso, [string]$TenantId, [string]$ClientId,
         [string]$CertKeyPem, [string]$CertThumbprint, [string]$CertPem, [string]$SiteHost,
-        [string]$Path = 'WinLTSC'
+        [string]$Path = ''
     )
     $token = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -CertKeyPem $CertKeyPem -CertThumbprint $CertThumbprint -CertPem $CertPem
     $siteId = Resolve-SiteDrive -Token $token -SiteHost $SiteHost
-    $driveRoot = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive/root"
+    $drive = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive"
     $h = @{ Authorization = "Bearer $token" }
-    # 确认 OD_PATH 父目录存在（不存在则建；这是 createUploadSession 不报 400 的前提）
-    Ensure-SharePointFolder -DriveRoot $driveRoot -Token $token -RelativePath $Path
-    $fileName = Split-Path $Iso -Leaf
-    # 路径段编码（<Path>/<file>）：直接用 OD_PATH 作目标目录，文件落在其下
-    # Path 可含子路径（如 ISO/WinLTSC），按 / 拆段各自编码（slash 是 Graph 寻址分隔符，不能整体转义）
-    $prefixSegs = @($Path -split '/' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { [System.Uri]::EscapeDataString($_) })
-    $seg = ($prefixSegs + [System.Uri]::EscapeDataString($fileName)) -join '/'
-    $createUrl = "$driveRoot/:$seg`:/createUploadSession"
-    # conflictBehavior=replace：目标文件若存在则覆盖（避免"已存在"误报 invalidRequest）
+    # 确保目标目录存在（空 Path = 默认文档库根，无需建；非空则建 Path 对应目录）
+    Ensure-SharePointFolder -DriveRoot $drive -Token $token -RelativePath $Path
+    $leaf = Split-Path $Iso -Leaf
+    $fileNameEnc = [System.Uri]::EscapeDataString($leaf)
+    # 相对路径：空 Path -> 仅文件名（落文档库根）；非空 -> Path/文件名
+    $relSegs = @()
+    if ($Path) { $relSegs += @($Path -split '/' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { [System.Uri]::EscapeDataString($_) }) }
+    $relSegs += $fileNameEnc
+    $relPath = $relSegs -join '/'
+    # 按路径寻址创建上传会话：drive/root:/<relPath>: （冒号紧贴 root，符合微软规范）
+    $createUrl = "$drive/root:/$relPath`:/createUploadSession"
+    # conflictBehavior=replace：目标文件若存在则覆盖（避免「已存在」误报 invalidRequest）
     $sessBody = (@{ '@microsoft.graph.conflictBehavior' = 'replace' } | ConvertTo-Json -Compress)
     $sess = Invoke-RestMethod -Uri $createUrl -Method Post -Headers $h -Body $sessBody -ContentType 'application/json'
 
@@ -223,7 +240,7 @@ function Send-SharePointUpload {
             Write-Host ("SharePoint 上传进度: {0:0.0}%" -f (100.0 * $start / $total))
         }
     } finally { $fs.Close() }
-    Write-Host "SharePoint 上传完成: $Path/$fileName"
+    Write-Host "SharePoint 上传完成: $leaf -> $Path"
 }
 
 # ---------- SharePoint：列举 + 删除（prune，保留 KEEP 个）----------
@@ -233,21 +250,27 @@ function Invoke-SharePointPrune {
     param(
         [string]$TenantId, [string]$ClientId, [string]$CertKeyPem, [string]$CertThumbprint, [string]$CertPem,
         [string]$SiteHost, [int]$Keep, [string]$Edition,
-        [string]$Path = 'WinLTSC'
+        [string]$Path = ''
     )
     $token = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -CertKeyPem $CertKeyPem -CertThumbprint $CertThumbprint -CertPem $CertPem
     $siteId = Resolve-SiteDrive -Token $token -SiteHost $SiteHost
+    $drive = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive"
     $h = @{ Authorization = "Bearer $token" }
-    # 确认 OD_PATH 存在（否则下方列举会 404）；不存在则建
-    Ensure-SharePointFolder -DriveRoot "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive/root" -Token $token -RelativePath $Path
-    $pathSegs = @($Path -split '/' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { [System.Uri]::EscapeDataString($_) })
-    $root = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive/root:/$(($pathSegs -join '/')):/children"
+    # 确认 OD_PATH 存在（否则下方列举会 404）；不存在则建。空 Path = 文档库根，无需建。
+    Ensure-SharePointFolder -DriveRoot $drive -Token $token -RelativePath $Path
+    # 列举 Path 目录下子项：空 Path -> drive/root/children；非空 -> drive/root:/<Path>:/children
+    if ($Path) {
+        $encPath = @($Path -split '/' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { [System.Uri]::EscapeDataString($_) }) -join '/'
+        $root = "$drive/root:/$encPath`:/children"
+    } else {
+        $root = "$drive/root/children"
+    }
     $r = Invoke-RestMethod -Uri $root -Headers $h -Method Get
     # 仅 .iso 且文件名含 $Edition；按名降序即按日期降序
     $files = @($r.value | Where-Object { $_.file -and $_.name -like '*.iso' -and $_.name -like "*-$Edition*" } | Sort-Object name -Descending)
     $old = @($files | Select-Object -Skip $Keep)
     foreach ($d in $old) {
-        Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive/items/$($d.id)" -Headers $h -Method Delete
+        Invoke-RestMethod -Uri "$drive/items/$($d.id)" -Headers $h -Method Delete
         Write-Host "SharePoint prune: 删除 $($d.name)"
     }
     if ($old.Count -eq 0) { Write-Host "SharePoint prune: 无超期 ISO（保留 $Keep 个）" }
