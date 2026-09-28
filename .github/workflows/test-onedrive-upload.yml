@@ -1,0 +1,145 @@
+name: Test OneDrive Upload
+
+# 轻量验证工作流：不构建 ISO，只验证 tools/cloud-upload.ps1 的 SharePoint/OneDrive 直传逻辑。
+# 覆盖：
+#   1) 默认站点 / 默认文档库寻址（Resolve-SiteDrive，SiteHost 为空走 /sites/root）
+#   2) Graph 路径语法修复 drive/root:/<path>:（非 drive/root/:<path>:）
+#   3) 子目录创建（Ensure-SharePointFolder 逐段建 OD_PATH/_ci_test）
+#   4) 多分片 upload session 上传（6MB 测试文件触发 2 片）
+#   5) 空 Path（= 文档库根）上传分支
+#   6) 收尾清理（删除测试文件与临时目录，不留垃圾）
+# 仅手动触发（workflow_dispatch），不随 push / cron / repository_dispatch 自动跑，避免误触完整构建。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-upload:
+    runs-on: windows-latest
+    env:
+      OD_TENANT_ID: ${{ secrets.ONEDRIVE_TENANT_ID }}
+      OD_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
+      OD_CERT_THUMBPRINT: ${{ secrets.ONEDRIVE_CERT_THUMBPRINT }}
+      OD_CERT_KEY: ${{ secrets.ONEDRIVE_CERT_KEY }}
+      OD_CERT: ${{ secrets.ONEDRIVE_CERT }}
+      OD_SITE_HOST: ${{ secrets.ONEDRIVE_SITE_HOST }}
+      OD_PATH: ${{ secrets.ONEDRIVE_PATH || 'WinLTSC' }}
+    steps:
+      - name: Checkout（取 tools/cloud-upload.ps1）
+        uses: actions/checkout@v7.0.1
+
+      - name: 生成两个随机测试文件（6MB 多分片 + 1MB 库根）
+        shell: pwsh
+        run: |
+          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          # 6MB：触发 upload session 多分片（5MiB/片 -> 2 片）
+          $big = New-Object byte[] (6 * 1024 * 1024)
+          $rng.GetBytes($big)
+          $bigName = "ci-upload-test_$(Get-Date -Format yyyyMMddHHmmss).bin"
+          [System.IO.File]::WriteAllBytes($bigName, $big)
+          # 1MB：验证「空 Path 落到文档库根」
+          $small = New-Object byte[] (1 * 1024 * 1024)
+          $rng.GetBytes($small)
+          $smallName = "ci-upload-root_$(Get-Date -Format yyyyMMddHHmmss).bin"
+          [System.IO.File]::WriteAllBytes($smallName, $small)
+          echo "TEST_FILE=$bigName" >> $env:GITHUB_ENV
+          echo "ROOT_FILE=$smallName" >> $env:GITHUB_ENV
+          echo "TEST_PATH=$($env:OD_PATH)/_ci_test" >> $env:GITHUB_ENV
+          Write-Host ("生成 {0} (6MB) 与 {1} (1MB)" -f $bigName, $smallName)
+
+      - name: 上传到 OD_PATH/_ci_test（多分片 + 目录创建）
+        shell: pwsh
+        run: |
+          $keyPath = "$env:RUNNER_TEMP\onedrive_key.pem"
+          Set-Content -Path $keyPath -Value $env:OD_CERT_KEY -NoNewline
+          $certPath = "$env:RUNNER_TEMP\onedrive_cert.pem"
+          if ($env:OD_CERT) { Set-Content -Path $certPath -Value $env:OD_CERT -NoNewline }
+          . ./tools/cloud-upload.ps1
+          Write-Host ("目标路径: {0}" -f $env:TEST_PATH)
+          Send-SharePointUpload -Iso $env:TEST_FILE `
+            -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
+            -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
+            -Path $env:TEST_PATH
+          Write-Host "✅ OD_PATH/_ci_test 上传调用完成"
+
+      - name: 上传到文档库根（验证空 Path 分支）
+        shell: pwsh
+        run: |
+          $keyPath = "$env:RUNNER_TEMP\onedrive_key.pem"
+          Set-Content -Path $keyPath -Value $env:OD_CERT_KEY -NoNewline
+          $certPath = "$env:RUNNER_TEMP\onedrive_cert.pem"
+          if ($env:OD_CERT) { Set-Content -Path $certPath -Value $env:OD_CERT -NoNewline }
+          . ./tools/cloud-upload.ps1
+          Write-Host "目标路径: （空 -> 默认文档库根）"
+          Send-SharePointUpload -Iso $env:ROOT_FILE `
+            -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
+            -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
+            -Path ''
+          Write-Host "✅ 文档库根上传调用完成"
+
+      - name: 验证两份文件均已落库
+        shell: pwsh
+        run: |
+          $keyPath = "$env:RUNNER_TEMP\onedrive_key.pem"
+          Set-Content -Path $keyPath -Value $env:OD_CERT_KEY -NoNewline
+          $certPath = "$env:RUNNER_TEMP\onedrive_cert.pem"
+          if ($env:OD_CERT) { Set-Content -Path $certPath -Value $env:OD_CERT -NoNewline }
+          . ./tools/cloud-upload.ps1
+          $token = Get-GraphToken -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath
+          $siteId = Resolve-SiteDrive -Token $token -SiteHost $env:OD_SITE_HOST
+          Write-Host ("✅ 默认站点/文档库解析成功 siteId={0}" -f $siteId)
+          $drive = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive"
+          $h = @{ Authorization = "Bearer $token" }
+          # ① 验证 _ci_test 目录与 6MB 文件
+          $encPath = @($env:TEST_PATH -split '/' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { [System.Uri]::EscapeDataString($_) }) -join '/'
+          $folder = Invoke-RestMethod -Uri "$drive/root:/$encPath`:" -Headers $h -Method Get
+          $r1 = Invoke-RestMethod -Uri "$drive/root:/$encPath`:/children" -Headers $h -Method Get
+          $hit1 = @($r1.value | Where-Object { $_.name -eq $env:TEST_FILE })
+          if ($hit1.Count -eq 0) { throw ("验证失败：{0} 未出现在 {1}" -f $env:TEST_FILE, $env:TEST_PATH) }
+          Write-Host ("✅ 目录内文件已落库：{0}  大小 {1:N2} MB" -f $hit1[0].name, ($hit1[0].size/1MB))
+          # ② 验证库根 1MB 文件
+          $r2 = Invoke-RestMethod -Uri "$drive/root/children" -Headers $h -Method Get
+          $hit2 = @($r2.value | Where-Object { $_.name -eq $env:ROOT_FILE })
+          if ($hit2.Count -eq 0) { throw ("验证失败：{0} 未出现在文档库根" -f $env:ROOT_FILE) }
+          Write-Host ("✅ 库根文件已落库：{0}  大小 {1:N2} MB" -f $hit2[0].name, ($hit2[0].size/1MB))
+          Write-Host "🎉 全部验证通过"
+
+      - name: 清理测试文件与临时目录（无论成功失败都跑）
+        if: always()
+        shell: pwsh
+        run: |
+          $keyPath = "$env:RUNNER_TEMP\onedrive_key.pem"
+          Set-Content -Path $keyPath -Value $env:OD_CERT_KEY -NoNewline
+          $certPath = "$env:RUNNER_TEMP\onedrive_cert.pem"
+          if ($env:OD_CERT) { Set-Content -Path $certPath -Value $env:OD_CERT -NoNewline }
+          . ./tools/cloud-upload.ps1
+          try {
+            $token = Get-GraphToken -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath
+            $siteId = Resolve-SiteDrive -Token $token -SiteHost $env:OD_SITE_HOST
+            $drive = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive"
+            $h = @{ Authorization = "Bearer $token" }
+            # ① 清 _ci_test：先删子项，再删空目录
+            try {
+              $encPath = @($env:TEST_PATH -split '/' | Where-Object { $_.Trim() -ne '' } | ForEach-Object { [System.Uri]::EscapeDataString($_) }) -join '/'
+              $r = Invoke-RestMethod -Uri "$drive/root:/$encPath`:/children" -Headers $h -Method Get
+              foreach ($c in $r.value) {
+                Invoke-RestMethod -Uri "$drive/items/$($c.id)" -Headers $h -Method Delete -ErrorAction Stop
+                Write-Host ("已删除子项 {0}" -f $c.name)
+              }
+              $f = Invoke-RestMethod -Uri "$drive/root:/$encPath`:" -Headers $h -Method Get
+              Invoke-RestMethod -Uri "$drive/items/$($f.id)" -Headers $h -Method Delete -ErrorAction Stop
+              Write-Host ("已删除测试目录 {0}" -f $env:TEST_PATH)
+            } catch { Write-Host ("⚠ _ci_test 清理跳过/失败（不影响结论）：{0}" -f $_.Exception.Message) }
+            # ② 清库根测试文件
+            try {
+              $r2 = Invoke-RestMethod -Uri "$drive/root/children" -Headers $h -Method Get
+              $hit = @($r2.value | Where-Object { $_.name -eq $env:ROOT_FILE })
+              foreach ($c in $hit) {
+                Invoke-RestMethod -Uri "$drive/items/$($c.id)" -Headers $h -Method Delete -ErrorAction Stop
+                Write-Host ("已删除库根测试文件 {0}" -f $c.name)
+              }
+            } catch { Write-Host ("⚠ 库根测试文件清理跳过/失败（不影响结论）：{0}" -f $_.Exception.Message) }
+          } catch { Write-Host ("⚠ 清理阶段整体失败（不影响验证结论）：{0}" -f $_.Exception.Message) }
