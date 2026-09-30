@@ -219,12 +219,14 @@ function Send-SharePointUpload {
     # 切片 = 50 MiB。微软硬约束：单分片 < 61,000,000 字节且必须为 320KiB(327680) 整数倍。
     # 50*1024*1024 = 52,428,800 = 160 * 327680，合法；5GB 从 ~1024 片降至 ~102 片。
     # 每片 PUT 带重试(429/5xx/网络异常) + 退避(尊重 Retry-After) + 断点续传(nextExpectedRanges)。
-    $chunkSize = 50 * 1024 * 1024
+    # 全部用 [long](Int64)：ISO 常 > 2.147GB（Int32 上限），否则 [Math]::Min/Max
+    # 在 int/long 混用时被解析到 Int32 重载，抛 "value was too large or too small for an Int32"。
+    [long]$chunkSize = 50L * 1024L * 1024L
     $maxRetries = 5
     $fs = [System.IO.File]::OpenRead($Iso)
-    $total = $fs.Length
+    [long]$total = $fs.Length
     try {
-        $start = 0
+        [long]$start = 0
         while ($start -lt $total) {
             $end = [Math]::Min($start + $chunkSize, $total) - 1
             $len = $end - $start + 1

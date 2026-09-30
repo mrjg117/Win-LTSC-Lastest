@@ -2,7 +2,8 @@ name: Test SharePoint Upload (large file)
 
 # 用「新上传策略」(50MiB 分片 + 每片重试/退避 + 断点续传) 推一个几 GB 的大文件到 SharePoint，
 # 验证体量路径下分片逻辑、重试/续传与错误透出都正常；跑完自动清理测试文件。
-# 手动触发，输入 size_gb 控制文件大小（默认 2，即几 GB 里取 2GB；可改 3/5 等）。
+# 手动触发，输入 size_gb 控制文件大小（默认 3；2.147GB 是 Int32 上限边界，3GB 已越界，
+# 足以复现生产 6GB 的 Int32 溢出失败条件；可改 6 精确镜像生产）。
 
 on:
   workflow_dispatch:
@@ -10,7 +11,7 @@ on:
       size_gb:
         description: "测试文件大小 (GB)，默认 2"
         required: false
-        default: "2"
+        default: "3"
       cleanup:
         description: "上传后是否删除测试文件 (true/false)"
         required: false

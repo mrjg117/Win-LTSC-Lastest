@@ -123,7 +123,7 @@ function Write-Cmd([string] $Path, [string] $Text) {
 function Get-SilentInstallPlan {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string] $Name, [Parameter(Mandatory)] [System.IO.FileInfo] $File)
-    $head = [IO.File]::ReadAllBytes($File.FullName)[0..([Math]::Min(1MB, $File.Length - 1))]
+    $head = [IO.File]::ReadAllBytes($File.FullName)[0..([int][Math]::Min([long]1MB, $File.Length - 1))]
     $text = [Text.Encoding]::ASCII.GetString($head)
     $n = $File.Name
     # 已知具名例外：命中即采用其已验证首选参数，且必须先于下方启发式头检测 ——
