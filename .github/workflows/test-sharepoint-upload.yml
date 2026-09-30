@@ -21,7 +21,6 @@ permissions:
 
 jobs:
   test-upload:
-    if: ${{ secrets.ONEDRIVE_TENANT_ID != '' }}
     runs-on: windows-latest
     env:
       OD_PATH: ${{ secrets.ONEDRIVE_PATH || 'WinLTSC' }}
