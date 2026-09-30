@@ -216,8 +216,11 @@ function Send-SharePointUpload {
     $sessBody = (@{ '@microsoft.graph.conflictBehavior' = 'replace' } | ConvertTo-Json -Compress)
     $sess = Invoke-RestMethod -Uri $createUrl -Method Post -Headers $h -Body $sessBody -ContentType 'application/json'
 
-    # 切片 = 5MiB，必须是 320KiB(327680) 的整数倍：5*1024*1024 / 327680 = 16.0 ✔
-    $chunkSize = 5 * 1024 * 1024
+    # 切片 = 50 MiB。微软硬约束：单分片 < 61,000,000 字节且必须为 320KiB(327680) 整数倍。
+    # 50*1024*1024 = 52,428,800 = 160 * 327680，合法；5GB 从 ~1024 片降至 ~102 片。
+    # 每片 PUT 带重试(429/5xx/网络异常) + 退避(尊重 Retry-After) + 断点续传(nextExpectedRanges)。
+    $chunkSize = 50 * 1024 * 1024
+    $maxRetries = 5
     $fs = [System.IO.File]::OpenRead($Iso)
     $total = $fs.Length
     try {
@@ -229,14 +232,90 @@ function Send-SharePointUpload {
             $fs.Seek($start, [System.IO.SeekOrigin]::Begin) | Out-Null
             $read = 0
             while ($read -lt $len) { $read += $fs.Read($buf, $read, $len - $read) }
-            # 临时分片文件给 Invoke-RestMethod -InFile
-            $tmp = [System.IO.Path]::GetTempFileName()
-            [System.IO.File]::WriteAllBytes($tmp, $buf)
-            $range = "bytes $start-$end/$total"
-            $ur = Invoke-RestMethod -Uri $sess.uploadUrl -Method Put -Headers @{ 'Content-Range' = $range } `
-                -InFile $tmp -ContentType 'application/octet-stream'
-            Remove-Item $tmp -Force
-            $start = $end + 1
+
+            $ok = $false
+            $attempt = 0
+            while (-not $ok -and $attempt -lt $maxRetries) {
+                $attempt++
+                # 临时分片文件给 Invoke-WebRequest -InFile
+                $tmp = [System.IO.Path]::GetTempFileName()
+                [System.IO.File]::WriteAllBytes($tmp, $buf)
+                $range = "bytes $start-$end/$total"
+                try {
+                    # 中间片返回 202 Accepted，末片返回 200/201 Created；均不抛异常
+                    Invoke-WebRequest -Uri $sess.uploadUrl -Method Put `
+                        -Headers @{ 'Content-Range' = $range } -InFile $tmp `
+                        -ContentType 'application/octet-stream' -TimeoutSec 600 -ErrorAction Stop | Out-Null
+                    $ok = $true
+                }
+                catch {
+                    # ---- 错误透出 + 重试判断 ----
+                    $statusCode = $null
+                    $respBody   = $null
+                    $respObj    = $null
+                    if ($_.Exception.Response) { $respObj = $_.Exception.Response }
+                    if ($respObj) {
+                        try { $statusCode = [int]$respObj.StatusCode } catch {}
+                        try {
+                            if ($respObj.Content) { $respBody = $respObj.Content }
+                            else {
+                                $sr = New-Object System.IO.StreamReader($respObj.GetResponseStream())
+                                $respBody = $sr.ReadToEnd()
+                            }
+                        } catch {}
+                    }
+                    # 可重试：429 限流 / 5xx 服务端错误 / 网络层异常(statusCode 为空)
+                    $retryable = ($statusCode -in @(429, 500, 502, 503, 504)) -or ($null -eq $statusCode)
+                    if (-not $retryable -or $attempt -ge $maxRetries) {
+                        if ($tmp -and (Test-Path $tmp)) { Remove-Item $tmp -Force }
+                        throw ("SharePoint 分片上传失败: range=$range status=$statusCode " +
+                               "attempt=$attempt/$maxRetries response=$respBody")
+                    }
+                    # 退避：优先尊重 Retry-After，否则指数退避 10/20/40/80/160s
+                    $wait = [Math]::Pow(2, $attempt) * 5
+                    if ($respObj) {
+                        try {
+                            if ($respObj.Headers -and $respObj.Headers.RetryAfter) {
+                                $ra = $respObj.Headers.RetryAfter
+                                if ($ra.Delta)    { $wait = [int]$ra.Delta.TotalSeconds }
+                                elseif ($ra.Date) { $wait = [int]($ra.Date - [DateTimeOffset]::UtcNow).TotalSeconds }
+                            }
+                            elseif ($respObj.Headers) {
+                                $raStr = $respObj.Headers.Get('Retry-After')
+                                $pw = 0
+                                if ($raStr -and [int]::TryParse($raStr, [ref]$pw)) { $wait = $pw }
+                            }
+                        } catch {}
+                    }
+                    if ($tmp -and (Test-Path $tmp)) { Remove-Item $tmp -Force }
+                    Write-Host ("SharePoint 分片失败(status=$statusCode)，第$attempt/$maxRetries 次，" +
+                                "将在 ${wait}s 后重试 range=$range")
+                    Start-Sleep -Seconds $wait
+                    # ---- 断点续传对齐：向会话询问 nextExpectedRanges ----
+                    try {
+                        $st = Invoke-RestMethod -Uri $sess.uploadUrl -Method Get -ErrorAction Stop
+                        if ($st.nextExpectedRanges -and $st.nextExpectedRanges.Count -gt 0) {
+                            $nr = ($st.nextExpectedRanges[0] -split '-')[0]
+                            $serverStart = [long]$nr
+                            if ($serverStart -gt $start) {
+                                Write-Host ("SharePoint 续传对齐: 服务器已收至 $($serverStart-1)，跳至 $serverStart")
+                                $start = $serverStart
+                                $end = [Math]::Min($start + $chunkSize, $total) - 1
+                                $len = $end - $start + 1
+                                $buf = New-Object byte[] $len
+                                $fs.Seek($start, [System.IO.SeekOrigin]::Begin) | Out-Null
+                                $read = 0
+                                while ($read -lt $len) { $read += $fs.Read($buf, $read, $len - $read) }
+                            }
+                        }
+                    } catch {}
+                }
+            }
+            if (-not $ok) {
+                throw "SharePoint 分片上传在 $maxRetries 次重试后仍失败: range=$range"
+            }
+            if ($tmp -and (Test-Path $tmp)) { Remove-Item $tmp -Force }
+            $start = [Math]::Max($start, $end + 1)
             Write-Host ("SharePoint 上传进度: {0:0.0}%" -f (100.0 * $start / $total))
         }
     } finally { $fs.Close() }

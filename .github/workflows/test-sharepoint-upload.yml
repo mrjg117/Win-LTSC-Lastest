@@ -1,0 +1,129 @@
+name: Test SharePoint Upload (large file)
+
+# 用「新上传策略」(50MiB 分片 + 每片重试/退避 + 断点续传) 推一个几 GB 的大文件到 SharePoint，
+# 验证体量路径下分片逻辑、重试/续传与错误透出都正常；跑完自动清理测试文件。
+# 手动触发，输入 size_gb 控制文件大小（默认 2，即几 GB 里取 2GB；可改 3/5 等）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      size_gb:
+        description: "测试文件大小 (GB)，默认 2"
+        required: false
+        default: "2"
+      cleanup:
+        description: "上传后是否删除测试文件 (true/false)"
+        required: false
+        default: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  test-upload:
+    if: ${{ secrets.ONEDRIVE_TENANT_ID != '' }}
+    runs-on: windows-latest
+    env:
+      OD_PATH: ${{ secrets.ONEDRIVE_PATH || 'WinLTSC' }}
+      TEST_SUBFOLDER: "_ci_largetest"
+    steps:
+      - name: Checkout（tools/）
+        uses: actions/checkout@v7.0.1
+        with:
+          path: self
+
+      - name: 生成大文件（稀疏全零，真实走网络上传）
+        shell: pwsh
+        env:
+          SIZE_GB: ${{ github.event.inputs.size_gb }}
+        run: |
+          $gb  = [double]$env:SIZE_GB
+          $bytes = [long]($gb * 1e9)
+          $p = "$env:RUNNER_TEMP\bigfile.bin"
+          Write-Host ("生成测试文件 {0} ({1} GB = {2} bytes)" -f $p, $gb, $bytes)
+          $fs = [System.IO.File]::Create($p)
+          $fs.SetLength($bytes)      # 稀疏文件：逻辑大小=几 GB，读出来是全零，真实占用带宽
+          $fs.Close()
+          if (-not (Test-Path $p)) { throw "测试文件生成失败: $p" }
+          Write-Host "测试文件就绪: $((Get-Item $p).Length) bytes"
+
+      - name: 上传到 SharePoint（新策略：50MiB 分片 + 重试 + 断点续传）
+        shell: pwsh
+        env:
+          OD_TENANT_ID: ${{ secrets.ONEDRIVE_TENANT_ID }}
+          OD_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
+          OD_CERT_THUMBPRINT: ${{ secrets.ONEDRIVE_CERT_THUMBPRINT }}
+          OD_CERT_KEY: ${{ secrets.ONEDRIVE_CERT_KEY }}
+          OD_CERT: ${{ secrets.ONEDRIVE_CERT }}
+          OD_SITE_HOST: ${{ secrets.ONEDRIVE_SITE_HOST }}
+        run: |
+          $keyPath  = "$env:RUNNER_TEMP\onedrive_key.pem"
+          Set-Content -Path $keyPath -Value $env:OD_CERT_KEY -NoNewline
+          $certPath = "$env:RUNNER_TEMP\onedrive_cert.pem"
+          if ($env:OD_CERT) { Set-Content -Path $certPath -Value $env:OD_CERT -NoNewline }
+          . self/tools/cloud-upload.ps1
+          $f    = "$env:RUNNER_TEMP\bigfile.bin"
+          $size = (Get-Item $f).Length
+          $dest = "$env:OD_PATH/$env:TEST_SUBFOLDER"
+          Write-Host ("上传 {0} ({1} bytes) -> {2}" -f (Split-Path $f -Leaf), $size, $dest)
+          Send-SharePointUpload -Iso $f `
+            -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID `
+            -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath -SiteHost $env:OD_SITE_HOST `
+            -Path $dest
+          Write-Host "上传成功：upload session 已完整收片（多分片 + 重试/续传均已走过）。"
+
+      - name: 校验远端文件大小
+        shell: pwsh
+        env:
+          OD_TENANT_ID: ${{ secrets.ONEDRIVE_TENANT_ID }}
+          OD_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
+          OD_CERT_THUMBPRINT: ${{ secrets.ONEDRIVE_CERT_THUMBPRINT }}
+          OD_CERT_KEY: ${{ secrets.ONEDRIVE_CERT_KEY }}
+          OD_CERT: ${{ secrets.ONEDRIVE_CERT }}
+          OD_SITE_HOST: ${{ secrets.ONEDRIVE_SITE_HOST }}
+        run: |
+          $keyPath  = "$env:RUNNER_TEMP\onedrive_key.pem"
+          $certPath = "$env:RUNNER_TEMP\onedrive_cert.pem"
+          . self/tools/cloud-upload.ps1
+          $token  = Get-GraphToken -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath
+          $siteId = Resolve-SiteDrive -Token $token -SiteHost $env:OD_SITE_HOST
+          $drive  = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive"
+          $h      = @{ Authorization = "Bearer $token" }
+          $leaf   = "bigfile.bin"
+          $rel    = ($env:OD_PATH, $env:TEST_SUBFOLDER, $leaf) -join '/'
+          $addr   = "$drive/root:/$rel`:"
+          $item   = Invoke-RestMethod -Uri $addr -Headers $h -Method Get
+          $remote = [long]$item.size
+          $local  = (Get-Item "$env:RUNNER_TEMP\bigfile.bin").Length
+          Write-Host ("远端 size={0} 本地 size={1}" -f $remote, $local)
+          if ($remote -ne $local) { throw ("大小不一致：远端 {0} vs 本地 {1}" -f $remote, $local) }
+          Write-Host "校验通过：远端大小与本地完全一致。"
+
+      - name: 清理测试文件
+        if: ${{ github.event.inputs.cleanup != 'false' }}
+        shell: pwsh
+        env:
+          OD_TENANT_ID: ${{ secrets.ONEDRIVE_TENANT_ID }}
+          OD_CLIENT_ID: ${{ secrets.ONEDRIVE_CLIENT_ID }}
+          OD_CERT_THUMBPRINT: ${{ secrets.ONEDRIVE_CERT_THUMBPRINT }}
+          OD_CERT_KEY: ${{ secrets.ONEDRIVE_CERT_KEY }}
+          OD_CERT: ${{ secrets.ONEDRIVE_CERT }}
+          OD_SITE_HOST: ${{ secrets.ONEDRIVE_SITE_HOST }}
+        run: |
+          $keyPath  = "$env:RUNNER_TEMP\onedrive_key.pem"
+          $certPath = "$env:RUNNER_TEMP\onedrive_cert.pem"
+          . self/tools/cloud-upload.ps1
+          $token  = Get-GraphToken -TenantId $env:OD_TENANT_ID -ClientId $env:OD_CLIENT_ID -CertKeyPem $keyPath -CertThumbprint $env:OD_CERT_THUMBPRINT -CertPem $certPath
+          $siteId = Resolve-SiteDrive -Token $token -SiteHost $env:OD_SITE_HOST
+          $drive  = "https://graph.microsoft.com/v1.0/sites/$([System.Uri]::EscapeDataString($siteId))/drive"
+          $h      = @{ Authorization = "Bearer $token" }
+          $leaf   = "bigfile.bin"
+          $rel    = ($env:OD_PATH, $env:TEST_SUBFOLDER, $leaf) -join '/'
+          $addr   = "$drive/root:/$rel`:"
+          try {
+            $item = Invoke-RestMethod -Uri $addr -Headers $h -Method Get -ErrorAction Stop
+            Invoke-RestMethod -Uri "$drive/items/$($item.id)" -Headers $h -Method Delete -ErrorAction Stop
+            Write-Host ("已删除测试文件: {0}" -f $item.id)
+          } catch {
+            Write-Host ("测试文件不存在或已清理（{0}），跳过。" -f $_.Exception.Message)
+          }
