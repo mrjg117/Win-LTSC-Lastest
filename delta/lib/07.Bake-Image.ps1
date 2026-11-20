@@ -11,7 +11,7 @@
                                    MAS\  + 激活系统.cmd   （要手动跑一次）
                                    install\               （组件安装器，首启自装后自删）
              4) 组件安装        config.json 的 optimize.components 的安装器 (.exe/.msi) 由
-                                 **应答文件**（synthesize pass RunSynchronous）在首次开机
+                                 **应答文件**（oobeSystem pass 的 FirstLogonCommands）在首次开机
                                  静默安装，落到各自官方默认目录（C:\Program Files\…），装完自删。
                                  assets\overwrite\<组件名>\ 下放了文件的话，会在该组件安装命令
                                  之后追加一条覆盖命令（见 4c）。
@@ -153,21 +153,26 @@ function Get-SilentInstallPlan {
     return @('/S', '/VERYSILENT /SP- /SUPPRESSMSGBOXES /NORESTART', '/S /NCRC') | ForEach-Object { "`"$n`" $_" }
 }
 
-# ---- 把组件静默安装写进应答文件（synthesize pass）----
-#   [为什么用应答文件] 安装器（Inno/NSIS/MSI）**没有任何官方途径**能在构建期直接注入镜像内部：
-#   DISM 只吃 .cab/.msu。所以「离线集成」的可行落点是：构建期把命令行写进镜像里 Windows 自带的
-#   应答机制，装完首次开机由系统自己跑一遍 → 落到 C:\Program Files 的正常安装（可用、可卸载、
-#   有「应用和功能」条目），并在跑完后自删应答文件，机器上不留自建脚本。
-#   [为什么不是「首启脚本」] 不是我们塞的常驻脚本/计划任务，是 Windows 自己的 unattend 机制；
-#   内容仅存在于 %SystemRoot%\Panther\unattend.xml，执行完即由 cmd 自删。
+# ---- 把组件静默安装写进应答文件（oobeSystem\FirstLogonCommands）----
+#   [为什么用 FirstLogonCommands] 这是微软官方的「首次登录执行命令」机制：
+#     · 合法 pass = oobeSystem；宿主组件 = Microsoft-Windows-Shell-Setup
+#     · 命令元素 = <SynchronousCommand>，其命令行子元素正是 <CommandLine>（官方示例即用）
+#     · Order 从 1 递增且唯一；在用户首次登录时执行，权限够装到 Program Files
+#   [旧实现的致命 bug] 曾用 pass="synthesize"（根本不是合法 pass）+ 元素 <CommandLine>
+#     直接挂在 Microsoft-Windows-Deployment\RunSynchronousCommand 下
+#     （那个组件的子元素官方要求 <Path>，没有 <CommandLine>）。构建期只做 [xml] 良构
+#     校验，不验 schema，所以全绿；装机时 Windows 静默忽略整段 → 组件一个都没装。
+#   [为什么不新建 component] 基础 unattend.xml 的 oobeSystem 已有一个 Shell-Setup 组件，
+#     同一 pass 放两个同名 component 会被 Windows 拒收。故只生成 FirstLogonCommands 片段，
+#     合并时替换基础模板里的 <!-- FIRST_LOGON_COMMANDS --> 占位符，并进那唯一的组件。
 function Write-InstallUnattend {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string] $WorkDir, [Parameter(Mandatory)] [string[]] $Commands)
     $esc = { param($s) $s -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;' }
     $p = '%SystemDrive%\Tools\install'
-    # [必须] RunSynchronous 的工作目录是 %SystemRoot%\System32，不是载荷目录 ——
-    #        直接写 "7z2603-x64.exe" /S 会找不到文件（失败还很安静）。
-    #        故每条都先 `cd /d "%SystemDrive%\Tools\install" && …`，用 && 保证 cd 失败就不执行安装。
+    # [必须] FirstLogonCommands 的 cwd 是 %SystemRoot%\System32，不是载荷目录 ——
+    #        直接写 "xxx.exe" /S 会找不到文件（失败还很安静）。
+    #        故每条都先 `cd /d "%SystemDrive%\Tools\install" && …`，用 && 保证 cd 失败就不执行。
     $all = @($Commands | ForEach-Object { "cmd.exe /c cd /d `"$p`" && $_" })
     # 收尾自删：应答文件 + 载荷目录都不留在成品机上
     $all += "cmd.exe /c del /f /q `"%SystemRoot%\Panther\unattend.xml`" & rd /s /q `"$p`""
@@ -181,27 +186,15 @@ function Write-InstallUnattend {
                   "          <Description>$desc</Description>`r`n" +
                   "        </SynchronousCommand>"
     }
-    # [必须] xmlns:wcm 声明在**组件段自己的 <component> 上**，不能靠根节点：
-    #        基础模板的根节点只有默认命名空间，而它各个 <component> 都是各自声明的
-    #        （见 config\unattend.xml 第 18/24/30 行）。这里保持同一风格 ——
-    #        声明挂在自己身上，合并进任何根节点都合法。
-    #        实测教训：漏了这个声明，[xml] 强转会报 "wcm 是未声明的前缀"，
-    #        整份应答文件非法、Windows 直接拒收。
-    $xml = @"
-<?xml version="1.0" encoding="utf-8"?>
-<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-  <settings pass="synthesize">
-    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-      <RunSynchronous>
-$($items -join "`r`n")
-      </RunSynchronous>
-    </component>
-  </settings>
-</unattend>
-"@
-    # 出站是 UTF-8 带 BOM（.NET 无法生成 UTF-16LE；XML 声明 utf-8 与之自洽）
+    # 只输出 FirstLogonCommands 片段（不含 unattend/settings/component 外壳）——
+    # 合并时替换基础模板 oobeSystem\Shell-Setup 组件里的占位符。
+    # 片段里的 wcm 前缀依赖基础模板根节点已声明 xmlns:wcm（见 unattend.xml 第 16 行），
+    # 故这里无需重复声明，且合并后整份 XML 合法。
+    $fragment = "      <FirstLogonCommands>`r`n" + ($items -join "`r`n") + "`r`n      </FirstLogonCommands>"
+    $cfgDir = Join-Path $WorkDir 'config'
+    if (-not (Test-Path $cfgDir)) { New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null }
     [IO.File]::WriteAllText((Join-Path $WorkDir 'config\unattend-components.xml'),
-                            $xml, (New-Object Text.UTF8Encoding($true)))
+                            $fragment, (New-Object Text.UTF8Encoding($false)))
 }
 
 $cfg = Get-Content (Join-Path $WorkDir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -399,13 +392,13 @@ pause
     }
 
     # 4b) 组件载荷（optimize.components 声明的那些）
-    #     安装器走**应答文件 synthesize pass 的 RunSynchronous** 静默安装，装到各自官方默认目录：
+    #     安装器走**应答文件 oobeSystem\FirstLogonCommands** 静默安装，装到各自官方默认目录：
     #       · 7-Zip  官方 FAQ：/S 静默、/D= 指定目录（**大小写敏感**）；x64 exe 默认 C:\Program Files\7-Zip
     #       · MPC-BE 是 Inno Setup 6.7；官方 iss：DefaultDirName={pf}\MPC-BE x64
     #                → x64 安装器里 {pf} = C:\Program Files（ArchitecturesInstallIn64BitMode=x64）
     #       · NDM（实测 Inno 5.5.7）默认 C:\Program Files (x86)\Neat Download Manager
     #       默认路径本就是「64 位程序进 64 位目录 / 该进 x86 的进 x86」，故不传目录参数，全用官方默认。
-    #     [为什么不用首启脚本] 这是 Windows 自己的应答机制（unattend.xml synthesize），
+    #     [为什么不用首启脚本] 这是 Windows 自己的应答机制（unattend.xml FirstLogonCommands），
     #       不是我们往系统里塞的常驻脚本；跑完由 cmd 自删，机器上不留任何自建代码。
     $redistSrc = Join-Path $WorkDir 'assets\redist'
     $redistFiles = @(Get-ChildItem $redistSrc -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne '.gitkeep' })
@@ -507,24 +500,29 @@ pause
     }
 
     # ---------- 5) 应答文件烤入（基础 + 组件，合一份）----------
-    #   基础项（区域/时区/OOBE）来自 config\unattend.xml，组件静默安装来自 4b 生成的
-    #   unattend-components.xml。两份 <settings> 的 pass 不同（specialize/oobeSystem 与
-    #   synthesize），根节点相同 → 直接取后者「根节点之后」的内容拼进前者即可，不需要 XML 库。
+    #   基础项（区域/时区/OOBE）来自 config\unattend.xml；组件静默安装由 Write-InstallUnattend
+    #   生成 FirstLogonCommands 片段（config\unattend-components.xml）。
+    #   两者都落在 oobeSystem 的同一个 Microsoft-Windows-Shell-Setup 组件里 —— 把片段
+    #   替换基础模板的 <!-- FIRST_LOGON_COMMANDS --> 占位符即可，不新增 settings/component
+    #   （同一 pass 放两个同名 component 会被 Windows 拒收）。
     $panther = Join-Path $mount 'Windows\Panther'
     New-Item -ItemType Directory -Force -Path $panther | Out-Null
     $baseXml = Get-Content (Join-Path $WorkDir 'config\unattend.xml') -Raw -Encoding UTF8
-    $tail = ''
     $compFile = Join-Path $WorkDir 'config\unattend-components.xml'
+    $placeholder = '<!-- FIRST_LOGON_COMMANDS -->'
     if (Test-Path $compFile) {
-        $compXml = Get-Content $compFile -Raw -Encoding UTF8
-        # 去掉 XML 声明 + 注释 + <unattend ...> 开标签 + </unattend> 收标签 = 纯 settings 段
-        # 组件段的 <component> 自带 xmlns:wcm 声明，故无需动基础模板的根节点
-        $tail = ($compXml -replace '(?s)^.*?<unattend[^>]*>', '' -replace '(?s)</unattend>\s*$', '').Trim()
-        Log "应答合并：基础项 + 组件静默安装（$(([regex]::Matches($tail,'<SynchronousCommand')).Count) 条命令）"
+        $fragment = Get-Content $compFile -Raw -Encoding UTF8
+        if ($baseXml -notlike "*$placeholder*") {
+            throw "基础 unattend.xml 缺少占位符 $placeholder —— 无法注入组件安装命令"
+        }
+        $merged = $baseXml.Replace($placeholder, $fragment)
+        $ncmd = ([regex]::Matches($merged, '<SynchronousCommand')).Count
+        Log "应答合并：基础项 + 组件静默安装（$ncmd 条命令，oobeSystem\FirstLogonCommands）"
     } else {
+        # 无组件时把占位符去掉，避免成品应答里留注释
+        $merged = $baseXml.Replace($placeholder, '')
         Log "应答合并：仅基础项（无组件安装）"
     }
-    $merged = $baseXml -replace '(?s)</unattend>\s*$', ($tail + "`r`n</unattend>`r`n")
     # 构建期就把合并结果按 XML 解析一遍 —— 未声明前缀之类的问题在这里炸掉，
     # 而不是等装机时 Windows 静默忽略整份应答（那种失败没人看得见）
     $null = [xml]$merged

@@ -46,7 +46,7 @@ if (Test-Path $t99) { Remove-Item $t99 -Recurse -Force }
 New-Item -ItemType Directory -Path (Join-Path $t99 'logs') -Force | Out-Null
 Copy-Item (Join-Path $PSScriptRoot '..\delta\win10ui-override.ini') (Join-Path $t99 'win10ui-override.ini') -Force
 # 伪造一份「上游 W10UI.ini」：必须含 config 里所有 optimize 组A 键，否则 99 会（正确地）报错
-$grpA = @('nosuggapp','nosuggtip','norestorage','nogamebar','oobebypass','UpdtBootFiles')
+$grpA = @('nosuggapp','nosuggtip','norestorage','nogamebar','UpdtBootFiles')
 $fake = @('; synthetic upstream ini','[Options]','wim2esd=1','ResetBase=1') +
         @($grpA | ForEach-Object { "$_=0" }) + @('netfx3=1','')
 [IO.File]::WriteAllBytes((Join-Path $t99 'W10UI.ini'),
@@ -183,27 +183,27 @@ Log "  结果: 文件烤入 $(if($ok1 -and $ok2){'OK'}else{'FAIL'})（unattend.x
 Log "=== 测试 07 的 registry 解析 / {ext} 展开（抽 07 源码里的函数实跑）==="
 try {
     $bakeSrc = Get-Content (Join-Path $PSScriptRoot '..\delta\lib\07.Bake-Image.ps1') -Raw
+    # [修复] 真实函数名是 ConvertTo-RegPut（旧版写成不存在的 ConvertFrom-RegLine，
+    #        导致本测试永远抽不到函数、恒 FAIL）。三个函数签名见 07 源码。
     $fns = @([regex]::Matches($bakeSrc,
-             '(?ms)^function (?:ConvertFrom-RegLine|Expand-RegPut|Get-RegistryActions) \{.*?^\}') |
+             '(?ms)^function (?:ConvertTo-RegPut|Expand-RegPut|Get-RegistryActions) \{.*?^\}') |
              ForEach-Object { $_.Value })
     if ($fns.Count -lt 3) { throw "没能从 07.Bake-Image.ps1 里抽出 3 个函数（实际 $($fns.Count) 个）" }
     foreach ($fn in $fns) { Invoke-Expression $fn }
 
     $okParse = $true
-    # 1) 基本解析：type 自动补 REG_ 前缀；value 里的竖线不被切开
+    # 1) ConvertTo-RegPut：接收已解析对象，type 补 REG_ 前缀；字段缺失必须抛错
     try {
-        $p = ConvertFrom-RegLine -Line 'SOFTWARE|Some\Path|Val|DWORD|1' -Where 'test'
+        $p = ConvertTo-RegPut -Put ([pscustomobject]@{hive='SOFTWARE';path='Some\Path';name='Val';type='DWORD';value='1'}) -Where 'test'
         if ($p.type -ne 'REG_DWORD' -or $p.value -ne '1') { $okParse = $false }
-        $p2 = ConvertFrom-RegLine -Line 'SOFTWARE|P|N|SZ|a|b|c' -Where 'test'
-        if ($p2.value -ne 'a|b|c') { $okParse = $false }
-        # 2) 段数不足必须抛错（不静默）
+        # 字段缺失必须抛错（不静默）
         $threw = $false
-        try { ConvertFrom-RegLine -Line 'SOFTWARE|P|N|SZ' -Where 'test' } catch { $threw = $true }
+        try { ConvertTo-RegPut -Put ([pscustomobject]@{hive='SOFTWARE';path='P';name='N';type='SZ'}) -Where 'test' } catch { $threw = $true }
         if (-not $threw) { $okParse = $false }
     } catch { $okParse = $false }
-    Log "  解析: $(if($okParse){'OK'}else{'FAIL'})（补 REG_ 前缀 / value 含竖线 / 段数不足报错）"
+    Log "  解析: $(if($okParse){'OK'}else{'FAIL'})（补 REG_ 前缀 / 字段缺失报错）"
 
-    # 3) {ext} 展开：3 个取值 -> 3 条；无 {ext} 原样返回；清单为空必须抛错
+    # 2) {ext} 展开：3 个取值 -> 3 条；无 {ext} 原样返回；清单为空必须抛错
     $put = [pscustomobject]@{ hive='SOFTWARE'; path='P\{ext}'; name='{ext}'; type='REG_SZ'; value='V' }
     $exp = @(Expand-RegPut -Put $put -Extensions @('.a','.b','.c'))
     $plain = [pscustomobject]@{ hive='SOFTWARE'; path='P'; name='N'; type='REG_SZ'; value='V' }
@@ -214,12 +214,14 @@ try {
              ($noexp.Count -eq 1) -and $threw2
     Log "  展开: $(if($okExt){'OK'}else{'FAIL'})（3 取值->3 条 / 无占位符原样 / 空清单报错）"
 
-    # 4) 用真 config.json 的 photo_viewer_legacy 跑一遍：5 条 puts 应展开成 4+13=17 条
+    # 3) 用真 config.json 的 photo_viewer_legacy 跑一遍：5 条 puts 应展开成 4+13=17 条
+    #    [修复] config.json 里拍平后的键名是 optimize.extensions（config-to-json.py 的
+    #           输出），不是 config.yml 里的 _extensions。
     $cfgPath = Join-Path $PSScriptRoot '..\config.json'
     if (Test-Path $cfgPath) {
         $cfgT = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
         $item = @($cfgT.optimize.registry) | Where-Object { $_.name -eq 'photo_viewer_legacy' }
-        $exts = @(@($cfgT.optimize._extensions) | ForEach-Object { [string]$_ })
+        $exts = @(@($cfgT.optimize.extensions) | ForEach-Object { [string]$_ })
         $acts = @(Get-RegistryActions -Item $item -Extensions $exts)
         $fa = @($acts | Where-Object { $_.path -like '*FileAssociations*' })
         $okPv = ($acts.Count -eq 17) -and ($fa.Count -eq $exts.Count)

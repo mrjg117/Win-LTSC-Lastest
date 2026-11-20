@@ -7,9 +7,8 @@
   [边界] Panther\unattend.xml 只对 specialize / oobeSystem 阶段生效。
          windowsPE 段（选版本 / 跳密钥 / 分区）放这里是死的 —— 那需要 ISO 根的
          \autounattend.xml，而它只在「从 ISO 引导标准安装」时有效，WinNTSetup 不读。
-  [不做] 不建账户、不自动登录、不跳「用户 OOBE」—— 本镜像不预建账户，跳过去只会
-         停在没有账户的登录页。账户留给装机的人自己建；要免联网建本地账户，
-         用 optimize 里的 oobebypass（写 OOBE\BypassNRO 注册表值）。
+  [不做] 不建账户、不自动登录、不跳「用户 OOBE」—— 本镜像不预建账户，账户留给装机的人
+         自己建。免联网建本地账户的注册表 trick 已被微软封堵，不再提供。
   [统一] 原两份模板（26100 / 19044）的差异项已收拢为一份：双方共有的保留，
          只有一个分支有的按上面 [不做] 的理由去掉 —— 不再维护两份必然漂移的副本。
 -->
@@ -34,6 +33,7 @@
         <ProtectYourPC>3</ProtectYourPC>
         <NetworkLocation>Work</NetworkLocation>
       </OOBE>
+      <!-- FIRST_LOGON_COMMANDS -->
     </component>
   </settings>
 </unattend>

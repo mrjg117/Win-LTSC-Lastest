@@ -10,8 +10,8 @@
                  落盘名 = <名字><扩展名>，07 正是靠 "名字.*" 通配取回它，两边必须一致
                  本脚本只负责下载；「安装还是解包」由 07.Bake-Image 按扩展名分流。
                  .zip 分发包装载（MPC-BE 官方 installer.zip 就是这种）：外层 zip 只是打包，
-                 里面才是真安装器 —— 这里就地解开、只留内层 .exe/.msi，
-                 免得把「一个 zip」当成安装包去写静默命令行。
+                 里面才是真安装器 —— 这里就地解开、只留内层 .exe/.msi，并按配置键名落盘
+                 （mpcbe.zip -> mpcbe.exe），与 07 的 "$k.*" 取回契约一致。
   apps       —— 清单里写一行装一个，落成 assets/apps/<键>/ 目录，并写 apps-manifest.json
                  · 12 位 Store 产品 ID → 经 rg-adguard 换出微软官方 CDN 直链（含依赖框架）
                  · 含 :// 的完整直链   → 直接下载
@@ -144,12 +144,17 @@ def download(url, path, expect_size=None, retries=4):
 INSTALLER_EXT = (".exe", ".msi")
 
 
-def unwrap_installer(path):
+def unwrap_installer(path, want_name=None):
     """若 path 是「装安装器的 zip」，就地解出唯一的安装器并返回其路径；否则原样返回。
 
     MPC-BE 官方只发 MPC-BE.1.9.1.x64-installer.zip，里面就一个 MPC-BE.1.9.1.x64.exe。
     外层 zip 如果不是这种形态（没有安装器 / 有多个），就原样保留并返回 None ——
     07 那边会按扩展名报错，绝不猜。
+
+    [落盘名契约] want_name 给定时，解出的安装器落盘为 <want_name><内层扩展名>。
+    07.Bake-Image 是按配置键通配取回载荷的（"$k.*"，如 mpcbe.*），而 MPC-BE 内层名
+    是 MPC-BE.1.9.1.x64.exe —— 若按内层名落盘，07 按 mpcbe.* 找不到，只 WARN 跳过
+    （组件静默安装失效的独立 bug）。故这里统一改成配置键名落盘，与 07 的契约对齐。
     """
     try:
         with zipfile.ZipFile(path) as z:
@@ -159,8 +164,9 @@ def unwrap_installer(path):
                 log(f"  ZIP 里安装器数量不是 1（{len(installers)}），按原样保留")
                 return None
             inner = installers[0]
-            out = os.path.join(os.path.dirname(path),
-                               os.path.basename(inner))
+            inner_ext = os.path.splitext(inner)[1]
+            out_name = (want_name + inner_ext) if want_name else os.path.basename(inner)
+            out = os.path.join(os.path.dirname(path), out_name)
             log(f"  解包 ZIP -> {os.path.basename(out)}（内层安装器）")
             with z.open(inner) as src, open(out, "wb") as dst:
                 while True:
@@ -192,7 +198,8 @@ def fetch_components(cfg, dest):
             log(f"下载组件 {name} <- {url}")
             download(url, path)
         if path.lower().endswith(".zip"):
-            inner = unwrap_installer(path)
+            # 传配置键名：解出的安装器落盘为 <name>.exe，与 07 的 "$k.*" 通配契约一致
+            inner = unwrap_installer(path, want_name=name)
             if inner:
                 path = inner
         saved.append(path)

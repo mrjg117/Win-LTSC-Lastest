@@ -7,9 +7,10 @@
                以 -Package 结尾   -> /Remove-Package
                其余              -> /Disable-Feature
    [注意] 名字需用真机 Get-WindowsCapability / Get-WindowsPackage 校准；
-          不存在、或已被累积更新取代的项记 SKIP 而不是 WARN ——
+          不存在、或已被累积更新取代的项记 SKIP 而不是 FAIL ——
           微软官方 Removable Packages 一旦被后续 LCU 取代就再也无法移除（CBS 报错），
           必然失败的项不该把日志刷满。
+          存在但 DISM 实际删除失败 = 真实失败，直接中止构建（不留假绿镜像）。
 #>
 [CmdletBinding()]
 param(
@@ -68,12 +69,16 @@ foreach ($n in $names) {
             $hit = $caps | Where-Object { $_.Name -ieq $n -and $_.State -eq 'Installed' }
             if (-not $hit) { Log "SKIP capability 未安装/不存在: $n"; $skipped++; continue }
             dism.exe /Image:$mount /Remove-Capability /CapabilityName:$n
-            if ($LASTEXITCODE -ne 0) { Log "WARN Remove-Capability 失败: $n" } else { $rcCap++ }
+            # [修复] 存在但删除失败必须中止 —— 否则「写了要卸却没卸」被 WARN 掩盖，构建假绿。
+            # 不存在/未安装的项在上面的 $hit 判断里已 SKIP，不会走到这里。
+            if ($LASTEXITCODE -ne 0) { throw "Remove-Capability 失败: $n（DISM 退出码 $LASTEXITCODE）" }
+            $rcCap++
         }
         'package' {
             if ($pkgs -notcontains $n) { Log "SKIP 包不存在（或已被更新取代，不可移除）: $n"; $skipped++; continue }
             dism.exe /Image:$mount /Remove-Package /PackageName:$n
-            if ($LASTEXITCODE -ne 0) { Log "WARN Remove-Package 失败: $n" } else { $rcPkg++ }
+            if ($LASTEXITCODE -ne 0) { throw "Remove-Package 失败: $n（DISM 退出码 $LASTEXITCODE）" }
+            $rcPkg++
         }
         'feature' {
             # [坑·实测] 离线映像的选项名是 /Disable-Feature，不是 /Disable-WindowsOptionalFeature
@@ -81,7 +86,9 @@ foreach ($n in $names) {
             #    19044 实测：MicrosoftWindowsPowerShellV2 / V2Root 两条都栽在这里，被静默 WARN 掉，
             #    于是"写了要卸的项其实没卸"）。与上面 /Remove-Capability 属同一类坑。
             dism.exe /Image:$mount /Disable-Feature /FeatureName:$n /Remove
-            if ($LASTEXITCODE -ne 0) { Log "WARN Disable-Feature 失败: $n" } else { $rcFeat++ }
+            # [修复] 同上：真实失败即中止，不让「写了要卸却没卸」变成假绿。
+            if ($LASTEXITCODE -ne 0) { throw "Disable-Feature 失败: $n（DISM 退出码 $LASTEXITCODE）" }
+            $rcFeat++
         }
     }
 }

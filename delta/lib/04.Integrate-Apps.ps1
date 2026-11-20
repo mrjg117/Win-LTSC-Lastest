@@ -5,6 +5,8 @@
              清单与相对路径写在 assets\apps\apps-manifest.json（抓取脚本产出，本脚本只读它，
              所以「装什么」的唯一真相源是 config.yml，路径由抓取脚本落成契约）。
              挂载 install.wim 后逐个 /Add-ProvisionedAppxPackage：
+               /Region:all 必带 —— 否则微软规则是"未指定区域时只有固定到开始布局才预置"，
+                             本项目无 StartLayout，会导致装机后应用根本不注册（构建却全绿）
                license 存在   -> 带 /LicensePath
                license 不存在 -> /SkipLicense
              [约束] 非 Store 来源的包用 /SkipLicense 预置后，用户首次登录注册需要
@@ -60,7 +62,14 @@ foreach ($rec in $recs) {
     #     count=1 -> "/Image:D:\...\mount /Add-ProvisionedAppxPackage /PackagePath:D:\...xxx.msixbundle"
     #   DISM 收到这个畸形单参 -> `Error: 123 Unable to access the image`（19044 实测即死在此）。
     #   故每个 `+` 表达式必须各自加括号。
-    $dargs = @(('/Image:' + $mount), '/Add-ProvisionedAppxPackage', ('/PackagePath:' + $main))
+    # [关键·预置生效] 必须带 /Region:all。微软官方原文：
+    #   "When a list of regions is not specified, the package will be provisioned only if
+    #    it is pinned to start layout." —— 未指定区域时，只有固定到开始布局的包才预置。
+    #   本项目没有 StartLayout，若不传本开关：DISM 退出 0、构建全绿、包写进预配清单，
+    #   但用户登录时不注册，装机后应用列表里找不到（"APP 不生效"的根因）。
+    #   /Region:all 是官方合法值："all, indicating that the app should be provisioned
+    #    for all regions"（见 DISM App Package Servicing 文档，含 /Region:"all" 示例）。
+    $dargs = @(('/Image:' + $mount), '/Add-ProvisionedAppxPackage', ('/PackagePath:' + $main), '/Region:all')
     $lic = if ($rec.license) { Abs $rec.license } else { $null }
     if ($lic -and (Test-Path $lic)) {
         $dargs += '/LicensePath:' + $lic

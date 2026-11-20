@@ -127,7 +127,6 @@ optimize:
     nosuggtip:  禁「建议 / Spotlight / 锁屏聚焦 / 搜索框推荐」
     norestorage: 关预留存储
     nogamebar:  关 Xbox Game Bar
-    oobebypass: OOBE 免联网建本地账户
     UpdtBootFiles: 更新 ISO 引导文件 + UEFI CA 2023 新安全启动证书（旧 CA 2026-06 已到期）
 
   # ===== 离线 hive 注册表写入（构建期写进镜像，装完即生效）=====
@@ -147,8 +146,6 @@ optimize:
     show_file_extensions: "DEFAULT|Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced|HideFileExt|DWORD|0"   # 显示文件扩展名
     show_hidden_files:    "DEFAULT|Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced|Hidden|DWORD|2"         # 默认不显示隐藏文件（手动开「显示隐藏的项目」即生效）
     show_system_files:    "DEFAULT|Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced|ShowSuperHidden|DWORD|1" # 手动开「显示隐藏」后一并显示系统文件
-    taskbar_align_left:   "DEFAULT|Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced|TaskbarAl|DWORD|0"    # Win11 任务栏左对齐
-    classic_context_menu: "DEFAULT|Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\\InprocServer32||SZ|"  # Win11 经典右键菜单
     numlock_on:           "DEFAULT|Control Panel\\Keyboard|InitialKeyboardIndicators|SZ|2"                                # 小键盘开机默认亮
 
     # --- 安全与兼容 ---
@@ -187,7 +184,7 @@ optimize:
   # ===== 组件：名字: 链接。写了 = 构建期下载，首次开机静默装 =====
   # 说明：DISM /Add-Package 只接受 .cab/.msu，而这些都是 NSIS/Inno 安装器 —— 没有任何官方途径
   #       在构建期直接写进镜像内部。官方可行落点是「部署后静默安装」：这里写进镜像里的
-  #       unattend.xml（synthesize pass），首次开机由 Windows 自己装一遍，跑完自删。
+  #       unattend.xml（oobeSystem 的 FirstLogonCommands），首次登录由 Windows 自己装一遍，跑完自删。
   #       得到的是正常安装：装到官方默认目录（C:\Program Files\…）、可卸载、有「应用和功能」条目。
   # 装法与参数由安装器类型自动判定；同家族多组候选依次试（前者失败自动试下一组），全失败才报错。
   #   .msi                  → msiexec /i "<文件>" /qn /norestart
@@ -247,6 +244,11 @@ apps:
   - https://github.com/M2Team/NanaZip/releases/download/7.0.1843.0/NanaZip_7.0.1843.0.msixbundle  # NanaZip 7.0 文件管理器（替代 7-Zip；license.xml 由抓取脚本按同名自动配对）
 
 # ---- 上传：值 = 保留份数；注释 / 不写 = 不上传 ----
+# 本段由 build_iso.yml 的 plan job 读取并传给 build job（storage 段是唯一真相源）：
+#   写了 release:3  = 上传 Release 并保留最近 3 份；注释掉 = 不上传。
+#   R2 / onedrive 除写了本段外，还需在仓库 Secrets 填对应凭据才会真正上传。
+# 注意：check-updates 用 Release 标签判断「当前构建到哪」，故 release 建议保持开启，
+#       否则每日更新检测将失去比较基准。
 storage:
   release: 3
   # r2: 1

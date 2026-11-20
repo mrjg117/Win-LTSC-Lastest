@@ -85,7 +85,7 @@
 | `optimize.registry` | 映射 | `开关名: "hive\|path\|name\|type\|value"`（或该串的列表）；08 挂载镜像后由 07 离线写 hive |
 | `optimize.components` | 映射 | `名字: 安装器直链`；构建期抓取 → 07 写进应答，首启静默安装 |
 | `optimize._extensions` | 列表 | `{ext}` 占位符的取值清单（仅当有 registry 项用到 `{ext}` 时才需要写） |
-| `storage` | 映射 | `release` / `r2` / `onedrive`，值 = 保留份数 |
+| `storage` | 映射 | `release` / `r2` / `onedrive`，写了 = 上传且值 = 保留份数，注释掉 = 不上传；由 plan job 读取传给 build job（唯一真相源，不再硬编码）。`release` 建议保持开启——check-updates 靠 Release 标签判断版本 |
 
 `remove` 的名字形态由脚本自动分流，**不匹配任何形态即报错退出**（不静默跳过）：
 
@@ -142,6 +142,14 @@ delta/assets/overwrite/ndm/NeatDM.exe       →  覆盖 %ProgramFiles(x86)%\Neat
 刻意不按体积排 —— 体积排序会选中旧版（实测 Media Player 会选到 2019 年的 48.5 MB 包，
 而现行版 `11.2607.16.0` 只有 38.4 MB）。加密包（`.eappxbundle` / `.emsixbundle`）
 无法离线预置，按扩展名直接丢弃。
+
+> **为什么预置必须带 `/Region:all`（2026-11 修正）**：微软 DISM 文档原文 —— "When a list of
+> regions is not specified, the package will be provisioned only if it is pinned to start layout."
+> 本项目没有 StartLayout，旧版 `/Add-ProvisionedAppxPackage` 未传 `/Region`，导致 DISM 退出 0、
+> 构建全绿、包写进预配清单，但用户登录时不注册，装机后应用列表里找不到。`04.Integrate-Apps.ps1`
+> 现固定传 `/Region:all`（官方合法值："all, indicating that the app should be provisioned for all
+> regions"）。`allow_all_trusted_apps=1` 仍需保留（NanaZip 走 `/SkipLicense` 时的信任开关），
+> 但它解决的是签名信任，不是区域预置——两者缺一不可。
 
 `config.yml` 在构建前由 `tools/config-to-json.py` 转成 `config.json`（Linux 侧一次解析 + 结构性校验：
 未知顶层键、空的 sources、分支没定义、edition 不在 gvlk 表、registry 竖线串段数/类型不对、
@@ -226,19 +234,34 @@ UBR 用 06 实测值，不猜。
 
 ### 5.2 组件怎么装上的：Windows 自己的应答机制，不是首启脚本
 
-`optimize.components` 里的安装器由 `07.Bake-Image.ps1` 写进 `unattend.xml` 的 **`synthesize` pass**
-（`RunSynchronous`），首次开机时由 Windows 自己执行，跑完自删：
+`optimize.components` 里的安装器由 `07.Bake-Image.ps1` 写进 `unattend.xml` 的
+**`oobeSystem` pass 的 `Microsoft-Windows-Shell-Setup\FirstLogonCommands`**，首次登录时由 Windows
+自己执行，跑完自删：
 
 ```xml
-<settings pass="synthesize">
-  <component name="Microsoft-Windows-Deployment" ...>
-    <RunSynchronous>
+<settings pass="oobeSystem">
+  <component name="Microsoft-Windows-Shell-Setup" ...>
+    <OOBE>...</OOBE>
+    <FirstLogonCommands>
       <SynchronousCommand wcm:action="add">
         <Order>1</Order>
-        <CommandLine>cmd.exe /c cd /d "%SystemDrive%\Tools\install" &amp;&amp; "7z2603-x64.exe" /S</CommandLine>
+        <CommandLine>cmd.exe /c cd /d "%SystemDrive%\Tools\install" &amp;&amp; "vc14_x64.exe" /install /quiet /norestart</CommandLine>
       </SynchronousCommand>
       ...
+    </FirstLogonCommands>
+  </component>
+</settings>
 ```
+
+> **为什么是 FirstLogonCommands（2026-11 修正）**：旧版用 `pass="synthesize"` +
+> `Microsoft-Windows-Deployment\RunSynchronousCommand` 挂 `<CommandLine>` —— `synthesize`
+> 不是合法 pass（官方只有 windowsPE / offlineServicing / generalize / specialize /
+> auditSystem / auditUser / oobeSystem），而 `RunSynchronousCommand` 的命令行子元素是
+> `<Path>`、不是 `<CommandLine>`（后者属于 `FirstLogonCommands\SynchronousCommand`）。
+> 构建期只做 `[xml]` 良构校验、不验 schema，所以旧版全绿但装机时整段被 Windows 静默忽略、
+> 组件一个都没装。现按官方标准机制改正：命令并进 oobeSystem 已有的那个 Shell-Setup 组件
+> （同一 pass 放两个同名 component 会被拒收），故基础模板留 `<!-- FIRST_LOGON_COMMANDS -->`
+> 占位符，构建期替换。
 
 **安装器类型自动识别，判不出就报错，绝不猜参数**：
 
@@ -248,7 +271,7 @@ UBR 用 06 实测值，不猜。
 | NSIS | `/S` |
 | vc_redist | `/install /quiet /norestart` |
 | `.msi` | `msiexec /i "<文件>" /qn /norestart` |
-| `.zip` | 若内含**唯一**一个 `.exe`/`.msi`，构建期就地解出内层安装器（外层 zip 丢弃） |
+| `.zip` | 若内含**唯一**一个 `.exe`/`.msi`，构建期就地解出内层安装器，并按**配置键名**落盘（如 `mpcbe.zip` → `mpcbe.exe`），与 07 的 `<键名>.*` 取回契约一致 |
 | 其余 | 原样保留 → 由 07 按扩展名报错 |
 
 **覆盖文件**（如换汉化版主程序）走 `assets/overwrite/<组件名>/`，由 4c 步追加在**该组件安装命令之后**
@@ -265,14 +288,11 @@ UBR 用 06 实测值，不猜。
 
 | 细节 | 为什么 |
 |---|---|
-| 每条命令都 `cd /d "%SystemDrive%\Tools\install" && …` | RunSynchronous 的 cwd 是 `%SystemRoot%\System32`，不 cd 就找不到安装器（**失败还很安静**） |
+| 每条命令都 `cd /d "%SystemDrive%\Tools\install" && …` | FirstLogonCommands 的 cwd 是 `%SystemRoot%\System32`，不 cd 就找不到安装器（**失败还很安静**） |
 | `<Order>` **从 1 递增且唯一** | 实测两次都写 `1` 时只认第一条 |
-| 组件段 `<component>` **自带 `xmlns:wcm`** | 基础模板把它声明在各自 `<component>` 上（不是根节点）；漏了 → `wcm 是未声明的前缀`，整份 XML 非法、Windows 静默拒收 |
+| 片段用基础模板根节点的 `xmlns:wcm` | FirstLogonCommands 并进已有的 Shell-Setup 组件，根节点已声明 `xmlns:wcm`（`unattend.xml` 第 16 行），无需重复声明 |
 | 合并后**构建期就用 `[xml]` 解析一遍** | 上面那类问题在构建期炸掉，别等装机才发现 |
 | 收尾自删 `Panther\unattend.xml` + `Tools\install` | 成品机上不留应答文件与载荷 |
-
-> 用了 `synthesize` 而不是 `oobeSystem\FirstLogonCommands`：前者在**无人应答阶段**执行，
-> 不依赖任何用户登录，也不需要在 OOBE 里塞命令。
 
 ### 5.3 优化与组件：全部数据都在 `config.yml` 一处
 
@@ -297,7 +317,7 @@ config.yml ── optimize ──┬── ini        ──▶  99.Force-W10UI-
 optimize:
   ini:
     nosuggapp:   禁第三方应用静默安装
-    oobebypass:  OOBE 免联网建本地账户
+    nogamebar:   关 Xbox Game Bar
 ```
 
 > 这些键全部是上游 `W10UI.ini` 自己的开关，上游会做离线 hive 注入 —— 我们**零自造代码**。
@@ -323,7 +343,6 @@ hive | path | name | type | value
 optimize:
   registry:
     disable_hibernate: "SYSTEM|{CS}\\Control\\Power|HibernateEnabled|DWORD|0"
-    taskbar_align_left: "DEFAULT|Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced|TaskbarAl|DWORD|0"
     # 一开关多写、多个键同源 → 用列表
     photo_viewer_legacy:
       - "SOFTWARE|Classes\\Applications\\photoviewer.dll\\shell\\open|MuiVerb|SZ|@%ProgramFiles%\\Windows Photo Viewer\\photoviewer.dll,-3043"
@@ -386,7 +405,7 @@ optimize:
 那需要 ISO 根的 `\autounattend.xml`，而它**只在从 ISO 引导标准安装时有效，WinNTSetup 不读**
 （它直接 apply wim + bcdboot，选盘选版本在它界面里点）。用 WinNTSetup 部署时，现在这套路径是对的。
 
-不预建账户、不自动登录、不跳「用户 OOBE」—— 要免联网建本地账户，用 `optimize` 里的 `oobebypass`。
+不预建账户、不自动登录、不跳「用户 OOBE」—— 账户留给装机的人自己建。免联网建本地账户的注册表 trick（BypassNRO）已被微软封堵，本项目不再提供。
 
 ### 5.5 SKU：构建时转到 IoT Enterprise LTSC
 
@@ -460,7 +479,7 @@ Server 是 `26100.33451`，客户端真值却是 `26100.9457`），取最大值�
 | 转 IoT 的 SKU 转换 | 中文镜像 `install.wim` 通常只有一个 index，但 `Dism /Get-TargetEditions` 允许升到 `IoTEnterpriseS`。**需首次实跑确认**（07 里已按官方 GVLK 写死映射，并做了转换后复检） |
 | 组件包名 / 功能名 | `remove` 里的名字需用 `Get-WindowsPackage` / `Get-WindowsCapability` 在真机校准；不存在或已被 LCU 取代的项会 SKIP |
 | 驱动 | 全量池注入 `install.wim` 留盘，PnP 只装匹配硬件 |
-| VC++ 运行库 / .NET / DirectX / MPC-BE / NDM | **无法构建期注入镜像**（DISM 只吃 cab/msu）→ 写进 `unattend.xml` 的 synthesize pass，首次开机静默装到官方默认路径（见 5.2）；NanaZip 走 `apps` 段按 MSIX 预置 |
+| VC++ 运行库 / .NET / DirectX / MPC-BE / NDM | **无法构建期注入镜像**（DISM 只吃 cab/msu）→ 写进 `unattend.xml` 的 oobeSystem\FirstLogonCommands，首次登录静默装到官方默认路径（见 5.2）；NanaZip 走 `apps` 段按 MSIX 预置 |
 
 ### 8.1 脚本的文本编码约定（改脚本前必读）
 
@@ -509,3 +528,38 @@ Server 是 `26100.33451`，客户端真值却是 `26100.9457`），取最大值�
 - `components` 的落地形态靠**安装器类型与扩展名分流**，覆盖目标靠**登记过的官方默认路径**，
   不逐项写死命令。
 - `remove` / `apps` 的清单在 `config.yml`，分流靠**值形态**（`~~~~`/`-Package`、12 位产品 ID / 直链）。
+
+---
+
+## 九、2026-11 生效性修复记录
+
+本次按微软官方文档逐项核对，砍掉不能稳定生效的功能、修复构建期假绿的 BUG。
+
+### 9.1 已删除的功能（原因：新版本无法稳定生效）
+
+| 配置项 | 删除原因 |
+|---|---|
+| `optimize.ini.oobebypass` | 微软 2025 起移除 `bypassnro` 并封堵 `BypassNRO=1` / `ms-cxh:localonly`，OOBE 免联网建本地账户不再可靠；唯一官方替代（预建账户 + 跳 OOBE）与设计冲突，故砍掉 |
+| `optimize.registry.taskbar_align_left` | `TaskbarAl=0` 是非文档化 tweak，24H2 后期 build 起被忽略，无官方 API/GPO 支持 |
+| `optimize.registry.classic_context_menu` | CLSID 钩子长期有效，但 2026-11 的 KB5132061（build 26100.9974 等）重写菜单引擎后失效；无官方替代 |
+
+涉及文件：`config.yml`、`delta/config/unattend.xml`、`tools/local-test.ps1`。
+
+### 9.2 已修复的 BUG（原构建全绿但功能不生效）
+
+| BUG | 修复 | 文件 |
+|---|---|---|
+| 应用预置不注册：DISM 未传 `/Region`，无 StartLayout 时微软规则是"只有固定到开始布局才预置" | `/Add-ProvisionedAppxPackage` 固定加 `/Region:all` | `delta/lib/04.Integrate-Apps.ps1` |
+| 组件一个都没装：应答用了非法 pass `synthesize` + 非法子元素 `<CommandLine>`，构建期只验 XML 良构故全绿 | 改用官方 `oobeSystem\FirstLogonCommands\SynchronousCommand`（`<CommandLine>` 合法）；并进已有 Shell-Setup 组件，基础模板用占位符注入 | `delta/lib/07.Bake-Image.ps1`、`delta/config/unattend.xml` |
+| MPC-BE 被跳过：解 zip 后按内层名 `MPC-BE.1.9.1.x64.exe` 落盘，07 却按配置键找 `mpcbe.*` | 解包后按配置键名落盘（`mpcbe.exe`） | `tools/fetch-payloads.py` |
+| remove 精简假绿：DISM 删除失败只记 WARN，构建照常通过 | 存在但删除失败即中止（不存在/已被 LCU 取代仍 SKIP） | `delta/lib/05.Patch-Components.ps1` |
+| storage 死配置：`config.yml.storage` 无人读取，工作流硬编码 `KEEP_*`/`DO_*` | plan job 读 storage 导出 outputs 给 build job，配置成为唯一真相源 | `.github/workflows/build_iso.yml`、`config.yml` |
+| `tools/local-test.ps1` 抽函数名 `ConvertFrom-RegLine`（不存在）+ 读 `optimize._extensions`（JSON 里实为 `extensions`），测试恒 FAIL | 改抽 `ConvertTo-RegPut`、改读 `optimize.extensions` | `tools/local-test.ps1` |
+
+官方依据：
+- DISM App Package 服务选项（`/Region:all`、`/Region` 未指定的行为）：
+  https://learn.microsoft.com/en-us/windows-hardware/manufacture/desktop/dism-app-package--appx-or-appxbundle--servicing-command-line-options
+- Windows Setup 合法配置 pass 列表（无 synthesize）：
+  https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/windows-setup-configuration-passes
+- FirstLogonCommands（oobeSystem，子元素用 CommandLine）：
+  https://learn.microsoft.com/en-us/windows-hardware/customize/desktop/unattend/microsoft-windows-shell-setup-firstlogoncommands

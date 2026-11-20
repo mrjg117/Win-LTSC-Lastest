@@ -33,6 +33,13 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.p.outputs.matrix }}
+      # 上传通道与保留份数：真相源 = config.yml 的 storage 段（写了才传，值=保留份数）
+      do_release: ${{ steps.upload.outputs.do_release }}
+      do_r2: ${{ steps.upload.outputs.do_r2 }}
+      do_onedrive: ${{ steps.upload.outputs.do_onedrive }}
+      keep_release: ${{ steps.upload.outputs.keep_release }}
+      keep_r2: ${{ steps.upload.outputs.keep_r2 }}
+      keep_onedrive: ${{ steps.upload.outputs.keep_onedrive }}
     steps:
       - name: Checkout（config.yml + tools/）
         uses: actions/checkout@v7.0.1
@@ -72,6 +79,28 @@ jobs:
           path: config.json
           retention-days: 1
 
+      - name: 上传通道与保留份数（真相源 = config.yml 的 storage 段）
+        id: upload
+        shell: bash
+        run: |
+          # config.json.storage 由 config-to-json.py 从 config.yml 的 storage 段拍平：
+          #   写了 "release: 3" = 上传 Release 且保留 3 份；注释掉/不写 = 不上传。
+          # 本步把「写了哪些通道 + 各保留几份」导出给 build job，替换原先的硬编码。
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          cfg = json.load(open("config.json", encoding="utf-8"))
+          st = cfg.get("storage") or {}
+          for ch in ("release", "r2", "onedrive"):
+              n = st.get(ch)
+              print(f"do_{ch}={'true' if isinstance(n, int) and n > 0 else 'false'}")
+              print(f"keep_{ch}={n if isinstance(n, int) and n > 0 else 0}")
+          PY
+          python3 - <<'PY'
+          import json
+          st = json.load(open("config.json", encoding="utf-8")).get("storage") or {}
+          print("storage 段生效通道:", ", ".join(f"{k}={v}" for k, v in st.items()) or "无（不上传）")
+          PY
+
   build:
     needs: plan
     runs-on: windows-latest
@@ -84,15 +113,16 @@ jobs:
       EDITION: ${{ matrix.edition }}
       SRC_ISO: ${{ matrix.iso }}
       SRC_SHA256: ${{ matrix.sha256 }}
-      # ── 上传通道开关：凭据驱动——哪个通道的 Secret 填了就自动开，没填就自动关，无需手动改代码。
-      #    （凭据缺失时硬传只会拿不到 token 报错，故用「Secret 非空」作为开关最稳。）
-      DO_RELEASE: "true"                                   # 仓库 Release 永远开（内置 token 即可）
-      DO_R2: ${{ secrets.R2_ACCESS_KEY_ID != '' }}         # 填了 R2_ACCESS_KEY_ID 才传 R2
-      DO_ONEDRIVE: ${{ secrets.ONEDRIVE_TENANT_ID != '' }} # 填了 ONEDRIVE_TENANT_ID 才传 OneDrive
-      # ── 各通道 prune 保留版本数 ──
-      KEEP_RELEASE: 3
-      KEEP_R2: 1
-      KEEP_ONEDRIVE: 2
+      # ── 上传通道开关：由 config.yml 的 storage 段决定（写了 = 开，注释掉 = 关）。
+      #    R2 / OneDrive 另需对应 Secret，否则传不了 —— 两个条件都满足才真正上传。
+      #    Release 只由 config 决定（内置 GITHUB_TOKEN 即可）。
+      DO_RELEASE: ${{ needs.plan.outputs.do_release }}
+      DO_R2: ${{ needs.plan.outputs.do_r2 == 'true' && secrets.R2_ACCESS_KEY_ID != '' }}
+      DO_ONEDRIVE: ${{ needs.plan.outputs.do_onedrive == 'true' && secrets.ONEDRIVE_TENANT_ID != '' }}
+      # ── 各通道 prune 保留版本数（同样来自 config.yml 的 storage 段） ──
+      KEEP_RELEASE: ${{ needs.plan.outputs.keep_release }}
+      KEEP_R2: ${{ needs.plan.outputs.keep_r2 }}
+      KEEP_ONEDRIVE: ${{ needs.plan.outputs.keep_onedrive }}
       # ── 分片大小（GB）：务必 < 各通道单文件硬上限 ──
       RELEASE_CHUNK: "1.9"    # GitHub Release 单文件硬上限 2GiB → 必须 < 2
       R2_CHUNK: "4.9"         # R2/S3 单 PUT 硬上限 5GiB → 必须 < 5
