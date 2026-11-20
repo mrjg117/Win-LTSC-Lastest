@@ -555,6 +555,9 @@ Server 是 `26100.33451`，客户端真值却是 `26100.9457`），取最大值�
 | remove 精简假绿：DISM 删除失败只记 WARN，构建照常通过 | 存在但删除失败即中止（不存在/已被 LCU 取代仍 SKIP） | `delta/lib/05.Patch-Components.ps1` |
 | storage 死配置：`config.yml.storage` 无人读取，工作流硬编码 `KEEP_*`/`DO_*` | plan job 读 storage 导出 outputs 给 build job，配置成为唯一真相源 | `.github/workflows/build_iso.yml`、`config.yml` |
 | `tools/local-test.ps1` 抽函数名 `ConvertFrom-RegLine`（不存在）+ 读 `optimize._extensions`（JSON 里实为 `extensions`），测试恒 FAIL | 改抽 `ConvertTo-RegPut`、改读 `optimize.extensions` | `tools/local-test.ps1` |
+| 抓取载荷恒失败：rg-adguard 2026 改版后 `<td>`/`<a>` 带属性、首格多写一个 `</td>`，旧正则整段零匹配 → 10/27 起连续 24 天构建卡在「抓取载荷」 | 改按 `<tr>` 切行、行内取 `<a href>` + 末格 size 的稳健解析；空包列表换 `ring`/`lang` 重试（应对真瞬态） | `tools/fetch-payloads.py` |
+
+> **构建失败会导致检测空转（机制说明）**：`Check Updates` 判断"是否已构建"只看 Release 标签。一旦构建中途失败（如上面的抓载荷失败），新标签不会生成，检测会认定"新版本还没做"而天天触发、天天失败——10/27～11/19 就是这么空转的。根因修复后构建能正常出标签，空转自然消失；但未来若再遇其它构建失败，同样会空转，排查时先看 `Build ISO` 的最近失败步骤，别只看 `Check Updates` 的成功状态。
 
 官方依据：
 - DISM App Package 服务选项（`/Region:all`、`/Region` 未指定的行为）：

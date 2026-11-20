@@ -208,46 +208,78 @@ def fetch_components(cfg, dest):
 
 # ---------------- apps ----------------
 
+def _parse_rg_rows(html):
+    """从 rg-adguard 响应里解析出 (url, 文件名, 大小字符串) 行。
+
+    [为什么不用旧的严格正则] rg-adguard 2026 年改版后 HTML 有两个坑，任何一个都会让
+    「<td><a href=...>...</a></td><td>...」这种单条正则整段零匹配（构建连续失败 24 天的真因）：
+      1. <td> / <a> 都带属性（<td style="text-align: left;">、<a ... rel="noreferrer">）；
+      2. 首格闭合处多写一个 </td>（</a></td></td><td ...>），严格匹配 4 连格直接断。
+    改为「按 <tr> 切行 → 行内找 <a href> 取文件名/URL → 取该行最后一个 <td> 当大小」，
+    对上面两种畸形都免疫。
+    """
+    out = []
+    for row in re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.S):
+        a = re.search(r'<a\s+href="([^"]+)"[^>]*>([^<]*)</a>', row, re.S)
+        if not a:
+            continue
+        tds = re.findall(r'<td[^>]*>(.*?)</td>', row, re.S)
+        cells = [re.sub(r'<[^>]+>', '', t).strip() for t in tds]
+        size = cells[-1] if cells else ''
+        out.append((a.group(1).strip(), a.group(2).strip(), size))
+    return out
+
+
 def rg_list(product_id):
-    """Store 产品 ID -> [(文件名, URL, 大小字节)]，只保留包本体（丢 BlockMap/arm）。"""
-    raw = http(RG_API, data={"type": "ProductId", "url": product_id,
-                             "ring": "Retail", "lang": "en-US"})
-    html = raw.decode("utf-8", "replace")
-    m = re.search(r"CategoryID:\s*</b>\s*<i>([^<]+)</i>", html)
-    if m:
-        log(f"  CategoryID = {m.group(1)}")
-    if "successfully received" not in html:
-        fail(f"rg-adguard 未返回成功标记（产品 ID {product_id}），首段: {html[:200]!r}")
-    rows = re.findall(r'<td><a href="([^"]+)"[^>]*>([^<]+)</a></td>'
-                      r'<td[^>]*>([^<]*)</td><td[^>]*>([^<]*)</td><td[^>]*>([^<]*)</td>', html)
-    items = []
-    for url, fname, _expire, _sha1, size in rows:
-        fname = fname.strip()
-        low = fname.lower()
-        if low.endswith(SKIP_EXT):
+    """Store 产品 ID -> [(文件名, URL, 大小字节)]，只保留包本体（丢 BlockMap/arm）。
+
+    带重试：rg-adguard 偶发返回「成功标记 + CategoryID 但零个包」（真瞬态），
+    此时换 ring/lang 重试。注意与「HTML 改版导致永远零包」区分——后者靠 _parse_rg_rows
+    的稳健解析解决，不靠重试。两者叠加才不会再次出现「构建全失败却查不出原因」。
+    """
+    # (ring, lang) 组合：主用 Retail/en-US，失败换其它，避免相同请求拿到相同空缓存
+    attempts = [("Retail", "en-US"), ("Fast", "en-US"),
+                ("Retail", "zh-CN"), ("Slow", "en-US")]
+    last_err = ''
+    for ring, lang in attempts:
+        raw = http(RG_API, data={"type": "ProductId", "url": product_id,
+                                 "ring": ring, "lang": lang})
+        html = raw.decode("utf-8", "replace")
+        m = re.search(r"CategoryID:\s*</b>\s*<i>([^<]+)</i>", html)
+        if m and ring == attempts[0][0]:
+            log(f"  CategoryID = {m.group(1)}")
+        if "successfully received" not in html:
+            last_err = f"未返回成功标记（ring={ring}, lang={lang}），首段: {html[:160]!r}"
+            log(f"WARN rg-adguard {last_err}")
             continue
-        if not low.endswith(PKG_EXT):
-            # 注意：加密包 .eappxbundle / .emsixbundle 天然落在这里被丢掉 ——
-            # 它们无法用于 DISM 离线预置（媒体播放器那种产品 ID 会同时给出加密与明文两份）。
-            continue
-        if "_arm_" in low or "_arm64_" in low or low.endswith("_arm64"):
-            # Arm 包在 x64 目标上 DISM 会直接忽略（官方：If the Arm dependency package is also
-            # specified or included, DISM will ignore it）—— 所以只丢 Arm，**不能丢 x86**。
-            continue
-        # [不要丢 x86] 官方文档：x64 目标映像上，架构相关的依赖必须把 **x86 与 x64 都给**
-        #   （"on an x64 target image, include a path to both the x86 and x64 dependency packages"）。
-        #   故 x86 包必须保留 —— 它只会作为**依赖**被选中：主包由 classify() 之后的
-        #   is_x64_or_neutral 排序决定，x64/neutral 永远优先，x86 主包排在末尾不会被取。
-        #   （历史上这里直接 continue 丢弃 x86，与官方要求冲突，会让 /Add-ProvisionedAppxPackage
-        #     缺 x86 依赖。）
-        nbytes = 0
-        msz = re.match(r"([\d.]+)\s*(KB|MB|GB)", size.strip(), re.I)
-        if msz:
-            nbytes = int(float(msz.group(1)) * {"KB": 1024, "MB": 1048576, "GB": 1073741824}[msz.group(2).upper()])
-        items.append((fname, url.rstrip(), nbytes))
-    if not items:
-        fail(f"rg-adguard 返回里没有可用的包（产品 ID {product_id}）")
-    return items
+        rows = _parse_rg_rows(html)
+        items = []
+        for url, fname, size in rows:
+            low = fname.lower()
+            if low.endswith(SKIP_EXT):
+                continue
+            if not low.endswith(PKG_EXT):
+                # 加密包 .eappxbundle / .emsixbundle 无法用于 DISM 离线预置，丢掉
+                continue
+            if "_arm_" in low or "_arm64_" in low or low.endswith("_arm64"):
+                # Arm 包在 x64 目标上 DISM 会直接忽略（官方：If the Arm dependency package is
+                # also specified or included, DISM will ignore it）—— 只丢 Arm，不丢 x86。
+                continue
+            # [不要丢 x86] 官方文档：x64 目标映像上，架构相关依赖必须 x86 与 x64 都给
+            #   （"on an x64 target image, include a path to both the x86 and x64 dependency packages"）。
+            #   x86 只作依赖被选中；主包由 classify() 后的 is_x64_or_neutral 排序决定。
+            nbytes = 0
+            msz = re.match(r"([\d.]+)\s*(KB|MB|GB)", size.strip(), re.I)
+            if msz:
+                nbytes = int(float(msz.group(1)) * {"KB": 1024, "MB": 1048576, "GB": 1073741824}[msz.group(2).upper()])
+            items.append((fname, url.rstrip(), nbytes))
+        if items:
+            if ring != attempts[0][0] or lang != attempts[0][1]:
+                log(f"  rg-adguard 在 ring={ring}/lang={lang} 下取到 {len(items)} 个包")
+            return items
+        last_err = f"成功标记存在但无可用包（ring={ring}, lang={lang}, 解析到 {len(rows)} 行）"
+        log(f"WARN rg-adguard {last_err}，换参数重试")
+    fail(f"rg-adguard 取包失败（产品 ID {product_id}）：{last_err}")
 
 
 def is_x64_or_neutral(fname):
